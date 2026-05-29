@@ -1,12 +1,3 @@
-/*
- * Copyright 2026 jrxmod
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- */
 package com.jrxmod.lumiereplay.client;
 
 import com.jrxmod.lumiereplay.LumierePlay;
@@ -34,7 +25,6 @@ public class LumierePlayClient implements ClientModInitializer {
     public void onInitializeClient() {
         LumierePlay.LOGGER.info("Lumiere Play client initializing...");
 
-        // VLC check runs eagerly so the result is cached before world join
         VlcChecker.isAvailable();
 
         YtDlpManager.initialize();
@@ -60,10 +50,23 @@ public class LumierePlayClient implements ClientModInitializer {
                 projector.setScreenSize(payload.screenWidth(), payload.screenHeight());
 
                 ProjectorRenderer.trackProjector(pos);
-                VideoManager.update(pos, payload.videoUrl(), payload.isPlaying(), payload.volume());
                 ProjectorSound.setBaseVolume(pos, payload.volume());
 
-                LumierePlay.LOGGER.debug("Projector synced at {} playing={}", pos, payload.isPlaying());
+                String url = payload.videoUrl();
+                boolean playing = payload.isPlaying();
+
+                if (url.isEmpty()) {
+                    // Explicit stop — destroy the player entirely
+                    VideoManager.update(pos, url, false, payload.volume());
+                } else if (!playing) {
+                    // Paused state — keep the player alive, just pause it
+                    VideoManager.pause(pos);
+                } else {
+                    // Playing — start or resume
+                    VideoManager.update(pos, url, true, payload.volume());
+                }
+
+                LumierePlay.LOGGER.debug("Projector synced at {} playing={}", pos, playing);
             });
         });
     }
@@ -77,7 +80,6 @@ public class LumierePlayClient implements ClientModInitializer {
 
             if (!(be instanceof ProjectorBlockEntity projector)) return ActionResult.PASS;
 
-            // Block interaction is not allowed when VLC is missing
             if (!VlcChecker.isAvailable()) return ActionResult.PASS;
 
             ProjectorRenderer.trackProjector(pos);
@@ -95,10 +97,6 @@ public class LumierePlayClient implements ClientModInitializer {
         });
     }
 
-    /**
-     * Shows a chat warning once per world join if libvlc is not found.
-     * The hint line tells the player exactly how to install VLC for their OS.
-     */
     private void registerJoinHandler() {
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             if (VlcChecker.isAvailable()) return;

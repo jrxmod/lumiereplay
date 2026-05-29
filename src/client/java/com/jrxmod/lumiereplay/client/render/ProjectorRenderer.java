@@ -3,6 +3,7 @@ package com.jrxmod.lumiereplay.client.render;
 import com.jrxmod.lumiereplay.ModBlocks;
 import com.jrxmod.lumiereplay.ProjectorBlock;
 import com.jrxmod.lumiereplay.ProjectorBlockEntity;
+import com.jrxmod.lumiereplay.client.video.VideoManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
@@ -30,7 +31,7 @@ import java.util.Set;
 /**
  * Renders a flat textured quad for each tracked projector.
  * The quad is rotated on the Y axis to match the block's FACING property.
- * Texture resolution is fixed at 1280x720 for all screen sizes.
+ * When the projector block is broken, VideoManager is notified to stop audio immediately.
  */
 public class ProjectorRenderer {
 
@@ -51,6 +52,8 @@ public class ProjectorRenderer {
         knownPos.remove(pos);
         ScreenTexture tex = textures.remove(pos);
         if (tex != null) tex.close();
+        // Stop audio and release the player — block is gone
+        VideoManager.stopAt(pos);
     }
 
     private static void onRenderLast(WorldRenderContext ctx) {
@@ -92,12 +95,10 @@ public class ProjectorRenderer {
         float w = projector.getScreenWidth();
         float h = projector.getScreenHeight();
 
-        // Translate to center-top of the block
         double cx = pos.getX() + 0.5 - cam.x;
         double cy = pos.getY() + 1.0 - cam.y;
         double cz = pos.getZ() + 0.5 - cam.z;
 
-        // Y rotation so the quad faces the same direction as FACING
         float yaw = switch (facing) {
             case NORTH -> 180f;
             case SOUTH -> 0f;
@@ -109,7 +110,6 @@ public class ProjectorRenderer {
         matrices.push();
         matrices.translate(cx, cy, cz);
         matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(yaw));
-        // Shift the quad slightly in front of the face so it clears the block surface
         matrices.translate(0.0, 0.0, -0.502);
 
         Matrix4f mat = matrices.peek().getPositionMatrix();

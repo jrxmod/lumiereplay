@@ -72,19 +72,20 @@ public class VideoManager {
         }
     }
 
-    // Overload for calls without quality (uses BEST by default)
     public static void update(BlockPos posIn, String url, boolean playing, int volume) {
         update(posIn, url, playing, volume, UrlResolver.Quality.BEST);
     }
 
+    // Only pauses if currently playing — prevents double-toggle from GUI + sync
     public static void pause(BlockPos posIn) {
         VideoPlayer p = players.get(posIn.toImmutable());
-        if (p != null) p.pause();
+        if (p != null && p.getState() != PlayerState.IDLE && p.getState() != PlayerState.ERROR) p.pause();
     }
 
+    // Only resumes if currently paused — prevents double-toggle from GUI + sync
     public static void resume(BlockPos posIn) {
         VideoPlayer p = players.get(posIn.toImmutable());
-        if (p != null) p.resume();
+        if (p != null && p.getState() == PlayerState.PAUSED) p.resume();
     }
 
     public static void updateVolume(BlockPos posIn, int volume) {
@@ -97,6 +98,14 @@ public class VideoManager {
         if (pending.contains(pos)) return PlayerState.RESOLVING;
         VideoPlayer p = players.get(pos);
         return p != null ? p.getState() : PlayerState.IDLE;
+    }
+
+    // Stops and releases the player — called when the projector block is broken
+    public static void stopAt(BlockPos posIn) {
+        BlockPos pos = posIn.toImmutable();
+        pending.remove(pos);
+        VideoPlayer p = players.remove(pos);
+        if (p != null) p.close();
     }
 
     private static void startPlayer(BlockPos pos, String url, int volume) {

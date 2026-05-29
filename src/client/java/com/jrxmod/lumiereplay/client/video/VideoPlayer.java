@@ -9,7 +9,6 @@ import uk.co.caprica.vlcj.player.base.MediaPlayer;
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter;
 import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer;
 import uk.co.caprica.vlcj.player.embedded.videosurface.CallbackVideoSurface;
-import uk.co.caprica.vlcj.player.embedded.videosurface.VideoSurfaceAdapters;
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat;
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormatCallback;
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.RenderCallback;
@@ -19,8 +18,8 @@ import java.nio.ByteBuffer;
 
 /**
  * Video player backed by VLCJ (libvlc).
- * VLC handles decoding, audio output, buffering, and A/V sync natively.
- * We receive BGRA pixel frames via RenderCallback and write them to ScreenTexture.
+ * Uses an explicit pauseRequested flag to survive VLC's async buffering/playing events.
+ * When pauseRequested is true any spurious playing event re-applies the pause immediately.
  */
 public class VideoPlayer implements AutoCloseable {
 
@@ -31,9 +30,10 @@ public class VideoPlayer implements AutoCloseable {
     private MediaPlayerFactory  factory;
     private EmbeddedMediaPlayer mediaPlayer;
 
-    private volatile PlayerState state        = PlayerState.IDLE;
-    private volatile int         targetVolume = 100;
-    private          int         frameCounter = 0;
+    private volatile PlayerState state          = PlayerState.IDLE;
+    private volatile boolean     pauseRequested = false;
+    private volatile int         targetVolume   = 100;
+    private          int         frameCounter   = 0;
 
     public VideoPlayer(String source, ScreenTexture screenTexture, BlockPos projectorPos) {
         this.source        = source;
@@ -52,7 +52,6 @@ public class VideoPlayer implements AutoCloseable {
 
             mediaPlayer = factory.mediaPlayers().newEmbeddedMediaPlayer();
 
-            // Attach callback video surface — VLC writes pixels, we receive them
             CallbackVideoSurface surface = factory.videoSurfaces().newVideoSurface(
                 new LumiereBufferFormatCallback(),
                 new LumiereRenderCallback(),
@@ -63,8 +62,14 @@ public class VideoPlayer implements AutoCloseable {
             mediaPlayer.events().addMediaPlayerEventListener(new MediaPlayerEventAdapter() {
                 @Override
                 public void playing(MediaPlayer mp) {
-                    state = PlayerState.PLAYING;
-                    LumierePlay.LOGGER.info("VLC playing: {}", source);
+                    if (pauseRequested) {
+                        // VLC fired playing after a pause request — re-apply pause immediately
+                        mp.controls().setPause(true);
+                        state = PlayerState.PAUSED;
+                    } else {
+                        state = PlayerState.PLAYING;
+                        LumierePlay.LOGGER.info("VLC playing: {}", source);
+                    }
                 }
 
                 @Override
@@ -79,7 +84,6 @@ public class VideoPlayer implements AutoCloseable {
 
                 @Override
                 public void finished(MediaPlayer mp) {
-                    // Loop file from beginning
                     mp.controls().setPosition(0f);
                     mp.controls().play();
                 }
@@ -92,7 +96,8 @@ public class VideoPlayer implements AutoCloseable {
 
                 @Override
                 public void buffering(MediaPlayer mp, float newCache) {
-                    if (newCache < 100f && state == PlayerState.PLAYING) {
+                    // Never overwrite PAUSED state — buffering events fire during pause too
+                    if (state != PlayerState.PAUSED && newCache < 100f) {
                         state = PlayerState.LOADING;
                     }
                 }
@@ -109,19 +114,22 @@ public class VideoPlayer implements AutoCloseable {
 
     public void pause() {
         if (mediaPlayer != null) {
-            mediaPlayer.controls().pause();
+            pauseRequested = true;
             state = PlayerState.PAUSED;
+            mediaPlayer.controls().setPause(true);
         }
     }
 
     public void resume() {
         if (mediaPlayer != null) {
-            mediaPlayer.controls().play();
+            pauseRequested = false;
             state = PlayerState.PLAYING;
+            mediaPlayer.controls().setPause(false);
         }
     }
 
     public void stop() {
+        pauseRequested = false;
         if (mediaPlayer != null) mediaPlayer.controls().stop();
         state = PlayerState.IDLE;
     }
@@ -136,12 +144,10 @@ public class VideoPlayer implements AutoCloseable {
 
     public PlayerState getState() { return state; }
 
-    // VLC requests our desired output buffer format
     private class LumiereBufferFormatCallback implements BufferFormatCallback {
         @Override
         public BufferFormat getBufferFormat(int sourceWidth, int sourceHeight) {
             LumierePlay.LOGGER.info("VLC source resolution: {}x{}", sourceWidth, sourceHeight);
-            // Request fixed 1280x720 — VLC scales internally
             return new RV32BufferFormat(ScreenTexture.RENDER_W, ScreenTexture.RENDER_H);
         }
 
@@ -149,7 +155,6 @@ public class VideoPlayer implements AutoCloseable {
         public void allocatedBuffers(ByteBuffer[] buffers) {}
     }
 
-    // Called by VLC's native thread on every decoded frame
     private class LumiereRenderCallback implements RenderCallback {
         @Override
         public void display(MediaPlayer mp, ByteBuffer[] nativeBuffers, BufferFormat bufferFormat) {
@@ -161,7 +166,6 @@ public class VideoPlayer implements AutoCloseable {
             screenTexture.setPixelsBgra(buf);
             screenTexture.upload();
 
-            // Update spatial audio volume every 15 frames
             if (++frameCounter % 15 == 0) {
                 float spatial = ProjectorSound.getEffectiveVolume(projectorPos);
                 int   vlcVol  = Math.max(0, Math.min(200, (int)(targetVolume * spatial)));
