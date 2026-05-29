@@ -1,0 +1,34 @@
+{
+    "item.lumiereplay.projector": "Lumière Projector",
+    "block.lumiereplay.projector": "Lumière Projector",
+    "itemGroup.lumiereplay.general": "Lumière Play",
+
+    "gui.lumiereplay.projector.title": "Lumière Play",
+    "gui.lumiereplay.projector.url_placeholder": "https://youtube.com/...  or  /path/file.mp4",
+    "gui.lumiereplay.projector.play": "▶ Play",
+    "gui.lumiereplay.projector.pause": "⏸",
+    "gui.lumiereplay.projector.resume": "▶",
+    "gui.lumiereplay.projector.stop": "⏹",
+    "gui.lumiereplay.projector.section_source": "Source",
+    "gui.lumiereplay.projector.section_playback": "Playback",
+    "gui.lumiereplay.projector.section_quality": "Quality",
+    "gui.lumiereplay.projector.section_screen": "Screen",
+    "gui.lumiereplay.projector.volume": "%s%%",
+
+    "gui.lumiereplay.status.idle": "○ Idle",
+    "gui.lumiereplay.status.playing": "● Playing",
+    "gui.lumiereplay.status.paused": "⏸ Paused",
+    "gui.lumiereplay.status.loading": "⟳ Loading...",
+    "gui.lumiereplay.status.resolving": "⟳ Resolving...",
+    "gui.lumiereplay.status.error": "✕ Error",
+
+    "screen.lumiereplay.resolving": "Resolving URL...",
+    "screen.lumiereplay.loading": "Loading video...",
+    "screen.lumiereplay.error": "Playback error",
+
+    "message.lumiereplay.vlc_missing": "[Lumière Play] VLC Media Player is not installed!",
+    "message.lumiereplay.vlc_missing_linux": "Install: sudo pacman -S vlc  or  sudo apt install vlc",
+    "message.lumiereplay.vlc_missing_windows": "Download: https://www.videolan.org/vlc/",
+    "message.lumiereplay.vlc_missing_mac": "Install: brew install vlc",
+    "message.lumiereplay.vlc_ok": "[Lumière Play] VLC detected successfully."
+}

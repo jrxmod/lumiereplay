@@ -1,0 +1,34 @@
+{
+    "item.lumiereplay.projector": "Проектор Lumière",
+    "block.lumiereplay.projector": "Проектор Lumière",
+    "itemGroup.lumiereplay.general": "Lumière Play",
+
+    "gui.lumiereplay.projector.title": "Lumière Play",
+    "gui.lumiereplay.projector.url_placeholder": "https://youtube.com/...  или  /путь/к/файлу.mp4",
+    "gui.lumiereplay.projector.play": "▶ Играть",
+    "gui.lumiereplay.projector.pause": "⏸",
+    "gui.lumiereplay.projector.resume": "▶",
+    "gui.lumiereplay.projector.stop": "⏹",
+    "gui.lumiereplay.projector.section_source": "Источник",
+    "gui.lumiereplay.projector.section_playback": "Управление",
+    "gui.lumiereplay.projector.section_quality": "Качество",
+    "gui.lumiereplay.projector.section_screen": "Экран",
+    "gui.lumiereplay.projector.volume": "%s%%",
+
+    "gui.lumiereplay.status.idle": "○ Ожидание",
+    "gui.lumiereplay.status.playing": "● Воспроизведение",
+    "gui.lumiereplay.status.paused": "⏸ Пауза",
+    "gui.lumiereplay.status.loading": "⟳ Загрузка...",
+    "gui.lumiereplay.status.resolving": "⟳ Получение ссылки...",
+    "gui.lumiereplay.status.error": "✕ Ошибка",
+
+    "screen.lumiereplay.resolving": "Получение ссылки...",
+    "screen.lumiereplay.loading": "Загрузка видео...",
+    "screen.lumiereplay.error": "Ошибка воспроизведения",
+
+    "message.lumiereplay.vlc_missing": "[Lumière Play] VLC Media Player не установлен!",
+    "message.lumiereplay.vlc_missing_linux": "Установите: sudo pacman -S vlc  или  sudo apt install vlc",
+    "message.lumiereplay.vlc_missing_windows": "Скачайте: https://www.videolan.org/vlc/",
+    "message.lumiereplay.vlc_missing_mac": "Установите: brew install vlc",
+    "message.lumiereplay.vlc_ok": "[Lumière Play] VLC обнаружен успешно."
+}

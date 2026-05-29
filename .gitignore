@@ -1,0 +1,14 @@
+.gradle/
+build/
+run/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+Thumbs.db
+modrinth.index.json
