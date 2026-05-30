@@ -6,10 +6,18 @@
         "IRI"
     ],
     "key": {
-        "G": { "item": "minecraft:glass_pane" },
-        "I": { "item": "minecraft:iron_ingot" },
-        "D": { "item": "minecraft:diamond" },
-        "R": { "item": "minecraft:redstone" }
+        "G": {
+            "item": "minecraft:glass_pane"
+        },
+        "I": {
+            "item": "minecraft:iron_ingot"
+        },
+        "D": {
+            "item": "minecraft:diamond"
+        },
+        "R": {
+            "item": "minecraft:redstone"
+        }
     },
     "result": {
         "id": "lumiereplay:projector",
