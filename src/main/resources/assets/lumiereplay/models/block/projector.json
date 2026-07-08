@@ -1,0 +1,12 @@
+{
+    "parent": "minecraft:block/cube",
+    "textures": {
+        "north": "lumiereplay:block/projector_front",
+        "south": "lumiereplay:block/projector_back",
+        "east":  "lumiereplay:block/projector_side",
+        "west":  "lumiereplay:block/projector_side",
+        "up":    "lumiereplay:block/projector_top",
+        "down":  "lumiereplay:block/projector_side",
+        "particle": "lumiereplay:block/projector_side"
+    }
+}

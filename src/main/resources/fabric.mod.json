@@ -1,0 +1,26 @@
+{
+    "schemaVersion": 1,
+    "id": "lumiereplay",
+    "version": "${version}",
+    "name": "Lumière Play",
+    "description": "In-game video projector and cinema experience for Minecraft. Place a projector block, choose your screen size, and watch videos together with friends.",
+    "authors": ["jrxmod"],
+    "contact": {
+        "homepage": "https://modrinth.com/user/jrxmod",
+        "sources": "https://github.com/jrxmod/lumiereplay",
+        "issues": "https://github.com/jrxmod/lumiereplay/issues"
+    },
+    "license": "Apache-2.0",
+    "icon": "assets/lumiereplay/icon.png",
+    "environment": "*",
+    "entrypoints": {
+        "main": ["com.jrxmod.lumiereplay.LumierePlay"],
+        "client": ["com.jrxmod.lumiereplay.client.LumierePlayClient"]
+    },
+    "depends": {
+        "fabricloader": ">=0.16.0",
+        "minecraft": "~1.21.1",
+        "java": ">=21",
+        "fabric-api": "*"
+    }
+}

@@ -1,0 +1,8 @@
+{
+    "variants": {
+        "facing=north": { "model": "lumiereplay:block/projector" },
+        "facing=south": { "model": "lumiereplay:block/projector", "y": 180 },
+        "facing=east":  { "model": "lumiereplay:block/projector", "y": 90 },
+        "facing=west":  { "model": "lumiereplay:block/projector", "y": 270 }
+    }
+}
