@@ -25,24 +25,19 @@ loom {
     }
 }
 
-configurations {
-    includeInJar
-}
-
 dependencies {
+    // Minecraft & mappings
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
-    // VLCJ — Java bindings for libvlc
-    implementation 'uk.co.caprica:vlcj:4.8.3'
-    includeInJar 'uk.co.caprica:vlcj:4.8.3'
-    includeInJar 'uk.co.caprica:vlcj-natives:4.8.3'
+    // VLCJ — embed in mod jar so end-user only needs libvlc, not vlcj on classpath
+    include(implementation('uk.co.caprica:vlcj:4.8.3'))
+    include(implementation('uk.co.caprica:vlcj-natives:4.8.3'))
 
-    // Gson — JSON config
-    implementation 'com.google.code.gson:gson:2.10.1'
-    includeInJar 'com.google.code.gson:gson:2.10.1'
+    // Gson — embed in mod jar
+    include(implementation('com.google.code.gson:gson:2.10.1'))
 }
 
 processResources {
@@ -56,20 +51,17 @@ tasks.withType(JavaCompile).configureEach {
     it.options.release = 21
 }
 
+java {
+    // withSourcesJar() intentionally omitted — it conflicts with
+    // Loom 1.8.x remapJar and produced a 261-byte empty jar in 0.5.4.
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
 jar {
+    // License required by Apache-2.0 license terms
     from("LICENSE") {
         rename { "${it}_${project.archivesBaseName}" }
     }
-    from {
-        configurations.includeInJar.collect {
-            it.isDirectory() ? it : zipTree(it)
-        }
-    }
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-}
-
-java {
-    withSourcesJar()
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
 }

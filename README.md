@@ -24,15 +24,17 @@ Place a projector block, choose your screen size, and watch videos together with
 - Fabric API 0.116.12+
 - Java 21
 - VLC 3.0+ installed (`libvlc` must be in `PATH` or installed system-wide)
-- `yt-dlp` and `ffmpeg` in `PATH`
+- `yt-dlp` and `ffmpeg` are bundled — the mod downloads them automatically on first run
+  (Linux: `~/.minecraft/lumiereplay/bin/`, Windows: `%APPDATA%\.minecraft\lumiereplay\bin\`)
+  if they are not already on your `PATH`
 
 ## Installation
 
 1. Install Fabric Loader for 1.21.1
-2. Drop `lumiereplay.jar` into `mods/`
-3. Install VLC, yt-dlp, ffmpeg
-4. Launch the game
-5. Craft a projector: 3 iron + 1 diamond + 3 iron (GGG/IDI/IRI)
+2. Drop the mod jar into `mods/`
+3. Install VLC (see "Requirements" above)
+4. Launch the game — yt-dlp and ffmpeg will be downloaded on first play
+5. Craft a projector: 3 glass + 1 diamond + 1 redstone + 3 iron (GGG/IDI/IRI)
 6. Place it, right-click to open GUI, paste a video URL
 
 ## Build from source
@@ -42,7 +44,7 @@ chmod +x build.sh install.sh gradlew
 ./build.sh
 ```
 
-Output: `build/libs/lumiereplay.jar`
+Output: `build/libs/lumiereplay-0.5.5.jar` (or whatever `mod_version` is set to)
 
 ## License
 

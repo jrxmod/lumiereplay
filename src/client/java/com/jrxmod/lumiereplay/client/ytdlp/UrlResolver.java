@@ -17,12 +17,14 @@ import java.util.function.Consumer;
  *
  * Two resolution strategies:
  *
- *   PROXY  — YouTube / youtu.be: yt-dlp is piped through a local HTTP proxy
- *             (StreamProxy). VLC plays http://127.0.0.1:PORT/stream. YouTube
- *             never sees VLC's IP — eliminates sefc=1 / IPv6-rotation 403s.
+ *   PROXY  — YouTube / Twitch / VK etc.: yt-dlp | ffmpeg | FIFO. VLC opens
+ *             the FIFO as a local file. ffmpeg rewrites discontinuous PCR
+ *             timestamps so VLC receives a clean, continuous MPEG-TS stream.
+ *             (YouTube HLS segments have PCR discontinuities that crash VLC
+ *             if played directly; ffmpeg with +genpts fixes this.)
  *
- *   DIRECT — All other platforms: classic --get-url approach returns a direct
- *             stream URL that VLC can fetch without session binding issues.
+ *   DIRECT — yt-dlp --get-url returns a stream URL that VLC fetches directly.
+ *             Used for platforms without HLS PCR issues.
  */
 public class UrlResolver {
 

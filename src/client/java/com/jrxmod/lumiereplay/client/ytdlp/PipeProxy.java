@@ -188,11 +188,16 @@ public class PipeProxy {
                         try {
                             fifo.write(buf, 0, n);
                         } catch (IOException broken) {
+                            // VLC closed the FIFO before we finished — stop the
+                            // upstream yt-dlp/ffmpeg to avoid orphaned processes.
                             break;
                         }
                     }
                 }
 
+                // Make sure both upstream processes are gone before we exit
+                if (ff.isAlive()) ff.destroyForcibly();
+                if (ytProc.isAlive()) ytProc.destroyForcibly();
                 ff.waitFor();
                 ytProc.waitFor();
                 LumierePlay.LOGGER.info("PipeProxy pipeline finished: {}", pipePath);

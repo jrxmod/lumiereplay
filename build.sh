@@ -2,7 +2,9 @@
 # Lumiere Play build script with Clash/V2RayN/Trojan TUN proxy detection
 set -e
 
-echo "==> Lumiere Play 0.5.4 build"
+# Read version from gradle.properties so we don't have to hardcode it here
+MOD_VERSION=$(grep '^mod_version=' gradle.properties | cut -d'=' -f2)
+echo "==> Lumiere Play ${MOD_VERSION} build"
 
 # Clash TUN proxy auto-detect (CN/RU/IR users)
 PROXY_PORTS="7890 7891 7892 8080 8888 3128 1080"
@@ -23,4 +25,4 @@ fi
 
 chmod +x gradlew
 ./gradlew clean build
-echo "==> Build complete: build/libs/lumiereplay-0.5.4.jar"
+echo "==> Build complete: build/libs/lumiereplay-${MOD_VERSION}.jar"

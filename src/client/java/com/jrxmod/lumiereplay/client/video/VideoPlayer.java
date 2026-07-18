@@ -16,14 +16,25 @@ import uk.co.caprica.vlcj.player.embedded.videosurface.callback.RenderCallback;
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.format.RV32BufferFormat;
 
 import java.nio.ByteBuffer;
+import java.util.Timer;
+import java.util.TimerTask;
 
 /**
  * Video player backed by VLCJ (libvlc).
  * Uses an explicit pauseRequested flag to survive VLC's async buffering/playing events.
  * When pauseRequested is true any spurious playing event re-applies the pause immediately.
  * For YouTube, the source is a localhost proxy URL (StreamProxy) — released on close().
+ *
+ * 0.5.5: added a 20s first-frame timeout and a "playing-after-frame" gate so the
+ * state machine doesn't claim PLAYING before VLC actually produced a decodable
+ * frame. Previously this caused users to see a frozen LOADING screen (or, when
+ * the texture was a black default, a flash of black) while VLC was still
+ * waiting for the pipe/HLS source to start producing data.
  */
 public class VideoPlayer implements AutoCloseable {
+
+    /** How long to wait for the first decodable frame before failing the source. */
+    private static final long FIRST_FRAME_TIMEOUT_MS = 20_000L;
 
     private final String        source;
     private final ScreenTexture screenTexture;
@@ -38,6 +49,7 @@ public class VideoPlayer implements AutoCloseable {
     private          int         frameCounter    = 0;
     private volatile boolean     firstFrameReceived  = false;
     private volatile Runnable     onRetry             = null;
+    private          Timer       firstFrameTimer     = null;
 
     public VideoPlayer(String source, ScreenTexture screenTexture, BlockPos projectorPos) {
         this.source        = source;
@@ -49,6 +61,9 @@ public class VideoPlayer implements AutoCloseable {
 
     public void play() {
         state = PlayerState.LOADING;
+        firstFrameReceived = false;
+        cancelFirstFrameTimer();
+        scheduleFirstFrameTimer();
         try {
             // FIFO paths need large file-caching — yt-dlp sleeps up to 15s before
             // YouTube allows download to start (rate-limiting on HLS streams).
@@ -88,10 +103,18 @@ public class VideoPlayer implements AutoCloseable {
                         // VLC fired playing after a pause request — re-apply pause immediately
                         mp.controls().setPause(true);
                         state = PlayerState.PAUSED;
-                    } else {
-                        state = PlayerState.PLAYING;
-                        LumierePlay.LOGGER.info("VLC playing: {}", source);
+                        return;
                     }
+                    if (!firstFrameReceived) {
+                        // VLC says "playing" but we have not yet decoded a frame.
+                        // Stay in LOADING so the user keeps seeing the loading screen
+                        // instead of a black screen / frozen screen. The first-frame
+                        // timeout will trip if this never resolves.
+                        LumierePlay.LOGGER.debug("VLC playing event before first frame for: {}", source);
+                        return;
+                    }
+                    state = PlayerState.PLAYING;
+                    LumierePlay.LOGGER.info("VLC playing: {}", source);
                 }
 
                 @Override
@@ -117,6 +140,7 @@ public class VideoPlayer implements AutoCloseable {
 
                 @Override
                 public void error(MediaPlayer mp) {
+                    cancelFirstFrameTimer();
                     state = PlayerState.ERROR;
                     LumierePlay.LOGGER.error("VLC error for: {}", source);
                     screenTexture.fillStatus(PlayerState.ERROR);
@@ -167,6 +191,7 @@ public class VideoPlayer implements AutoCloseable {
     }
 
     public void stop() {
+        cancelFirstFrameTimer();
         pauseRequested = false;
         firstFrameReceived = false;
         if (mediaPlayer != null) mediaPlayer.controls().stop();
@@ -221,17 +246,29 @@ public class VideoPlayer implements AutoCloseable {
             // Keeping LOADING texture until first non-empty frame prevents
             // the black-frame flash that looks like a freeze.
             if (!firstFrameReceived) {
-                // Check if this buffer has any non-zero bytes (real content)
+                // Sample the frame instead of checking individual bytes.
+                // BGRA means the first byte of each pixel is the blue channel.
+                // A solid black frame has every B,G,R byte = 0, so we check
+                // that the average brightness of a small sample is above a
+                // threshold. This rejects both pitch-black frames and
+                // frames with only stray metadata bytes.
                 buf.mark();
-                boolean hasContent = false;
-                byte[] probe = new byte[Math.min(1024, buf.remaining())];
+                int probeLen = Math.min(1024, buf.remaining());
+                byte[] probe = new byte[probeLen];
                 buf.get(probe);
-                for (byte b : probe) {
-                    if (b != 0) { hasContent = true; break; }
-                }
                 buf.reset();
-                if (!hasContent) return;
+
+                int brightCount = 0;
+                for (int i = 0; i < probeLen; i += 4) {
+                    int b = probe[i]     & 0xff;
+                    int g = probe[i + 1] & 0xff;
+                    int r = probe[i + 2] & 0xff;
+                    if (b + g + r > 24) { brightCount++; }
+                }
+                if (brightCount < 4) return;
+
                 firstFrameReceived = true;
+                cancelFirstFrameTimer();
                 LumierePlay.LOGGER.info("First real frame received: {}", source);
             }
             screenTexture.setPixelsBgra(buf);
@@ -283,6 +320,7 @@ public class VideoPlayer implements AutoCloseable {
     }
 
     public void close() {
+        cancelFirstFrameTimer();
         stop();
         if (mediaPlayer != null) {
             mediaPlayer.release();
@@ -296,6 +334,41 @@ public class VideoPlayer implements AutoCloseable {
         if (source != null && (source.startsWith("/tmp/") || source.startsWith("/var/")
                 || source.contains("lumiereplay_"))) {
             PipeProxy.release(source);
+        }
+    }
+
+    /**
+     * Schedule a watchdog that will fail the source if the first decodable
+     * frame does not arrive within {@link #FIRST_FRAME_TIMEOUT_MS}. Without
+     * this, broken pipes / dead HLS endpoints can leave the user staring at
+     * a LOADING screen indefinitely.
+     */
+    private void scheduleFirstFrameTimer() {
+        firstFrameTimer = new Timer("lumiereplay-first-frame-watchdog", true);
+        firstFrameTimer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                if (firstFrameReceived) return;
+                if (state == PlayerState.ERROR || state == PlayerState.IDLE) return;
+                LumierePlay.LOGGER.error(
+                    "No frame decoded within {}ms for: {}",
+                    FIRST_FRAME_TIMEOUT_MS, source
+                );
+                state = PlayerState.ERROR;
+                try {
+                    screenTexture.fillStatus(PlayerState.ERROR);
+                } catch (Exception ignored) {}
+                if (mediaPlayer != null) {
+                    try { mediaPlayer.controls().stop(); } catch (Exception ignored) {}
+                }
+            }
+        }, FIRST_FRAME_TIMEOUT_MS);
+    }
+
+    private void cancelFirstFrameTimer() {
+        if (firstFrameTimer != null) {
+            firstFrameTimer.cancel();
+            firstFrameTimer = null;
         }
     }
 }
