@@ -33,6 +33,7 @@
   "message.lumiereplay.ffmpeg_missing_mac": "Или установите вручную: brew install ffmpeg",
   "gui.lumiereplay.projector.section_access": "Доступ",
   "gui.lumiereplay.projector.access": "Доступ: %s",
+  "gui.lumiereplay.projector.live": "◉ Прямой эфир",
   "gui.lumiereplay.projector.access_locked": "Доступ: управляется владельцем",
   "gui.lumiereplay.projector.redstone_active": "⚡ Редстоун"
 }

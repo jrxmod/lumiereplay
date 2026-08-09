@@ -1,6 +1,5 @@
 package com.jrxmod.lumiereplay;
 
-import net.fabricmc.fabric.api.object.builder.v1.block.entity.FabricBlockEntityTypeBuilder;
 import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.Registry;
@@ -13,10 +12,10 @@ public final class ModBlockEntities {
         Registry.register(
             Registries.BLOCK_ENTITY_TYPE,
             Identifier.of(LumierePlay.MOD_ID, "projector"),
-            FabricBlockEntityTypeBuilder.create(
+            BlockEntityType.Builder.create(
                 ProjectorBlockEntity::new,
                 ModBlocks.PROJECTOR
-            ).build()
+            ).build(null)
         );
 
     /**

@@ -83,6 +83,15 @@ public class LumierePlayClient implements ClientModInitializer {
 
             if (!VlcChecker.isAvailable()) return ActionResult.PASS;
 
+            if (!projector.canInteract(player)) {
+                player.sendMessage(
+                    Text.translatable("gui.lumiereplay.projector.access_locked")
+                        .formatted(Formatting.RED),
+                    true
+                );
+                return ActionResult.SUCCESS;
+            }
+
             ProjectorRenderer.trackProjector(pos);
 
             MinecraftClient.getInstance().setScreen(new ProjectorScreen(

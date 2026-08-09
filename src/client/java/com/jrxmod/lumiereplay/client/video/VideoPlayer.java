@@ -185,7 +185,9 @@ public class VideoPlayer implements AutoCloseable {
     public void resume() {
         if (mediaPlayer != null) {
             pauseRequested = false;
-            state = PlayerState.PLAYING;
+            // PLAYING state is set by VLC's playing() event callback after
+            // buffering completes. Setting it here would show PLAYING while
+            // VLC is still buffering, misleading the user.
             mediaPlayer.controls().setPause(false);
         }
     }
@@ -210,8 +212,17 @@ public class VideoPlayer implements AutoCloseable {
 
     public void setOnRetry(Runnable r) { this.onRetry = r; }
 
+    /**
+     * Identifies paths created by {@link PipeProxy}.
+     * Matches /tmp/lumiereplay_UUID.ts (Linux/macOS) and temp dir equivalents
+     * on Windows. Requires a path separator before the prefix to avoid false
+     * positives from domain names or URL parameters containing the substring.
+     */
     private static boolean isPipePath(String s) {
-        return s != null && s.contains("lumiereplay_");
+        if (s == null) return false;
+        int idx = s.indexOf("lumiereplay_");
+        if (idx < 0) return false;
+        return idx == 0 || s.charAt(idx - 1) == '/' || s.charAt(idx - 1) == '\\';
     }
 
     private class LumiereBufferFormatCallback implements BufferFormatCallback {

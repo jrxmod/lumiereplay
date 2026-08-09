@@ -67,6 +67,27 @@ public class ProjectorBlock extends BlockWithEntity {
     }
 
     /**
+     * Stops remote playback immediately when the block is removed or replaced.
+     * Without this, clients keep rendering stale video for one or two frames
+     * until the renderer notices the block is gone.
+     */
+    @Override
+    protected void onStateReplaced(BlockState state, World world, BlockPos pos,
+                                   BlockState newState, boolean moved) {
+        if (!world.isClient() && !state.isOf(newState.getBlock())) {
+            if (world instanceof ServerWorld serverWorld) {
+                ProjectorSyncPayload sync = new ProjectorSyncPayload(
+                    pos, "", false, 0, 16, 9, AccessMode.ALL
+                );
+                for (var player : PlayerLookup.tracking(serverWorld, pos)) {
+                    ServerPlayNetworking.send(player, sync);
+                }
+            }
+        }
+        super.onStateReplaced(state, world, pos, newState, moved);
+    }
+
+    /**
      * Detects redstone rising and falling edges.
      * Rising edge (signal appears)  — plays the projector if a URL is set.
      * Falling edge (signal removed) — pauses the projector.
@@ -74,10 +95,10 @@ public class ProjectorBlock extends BlockWithEntity {
      * so no extra NBT field is needed.
      */
     @Override
-    public void neighborUpdate(BlockState state, World world, BlockPos pos,
-                               net.minecraft.block.Block sourceBlock,
-                               net.minecraft.util.math.BlockPos sourcePos,
-                               boolean notify) {
+    protected void neighborUpdate(BlockState state, World world, BlockPos pos,
+                                  net.minecraft.block.Block sourceBlock,
+                                  net.minecraft.util.math.BlockPos sourcePos,
+                                  boolean notify) {
         super.neighborUpdate(state, world, pos, sourceBlock, sourcePos, notify);
         if (world.isClient()) return;
         if (!(world.getBlockEntity(pos) instanceof ProjectorBlockEntity projector)) return;
@@ -127,8 +148,8 @@ public class ProjectorBlock extends BlockWithEntity {
     }
 
     @Override
-    public ActionResult onUse(BlockState state, World world, BlockPos pos,
-                              PlayerEntity player, BlockHitResult hit) {
+    protected ActionResult onUse(BlockState state, World world, BlockPos pos,
+                                 PlayerEntity player, BlockHitResult hit) {
         if (world.isClient()) {
             LumierePlay.LOGGER.debug("Projector right-clicked at {} facing {}",
                 pos, state.get(FACING));

@@ -33,6 +33,7 @@
   "message.lumiereplay.ffmpeg_missing_mac": "Or install manually: brew install ffmpeg",
   "gui.lumiereplay.projector.section_access": "Access",
   "gui.lumiereplay.projector.access": "Access: %s",
+  "gui.lumiereplay.projector.live": "◉ Live",
   "gui.lumiereplay.projector.access_locked": "Access: controlled by owner",
   "gui.lumiereplay.projector.redstone_active": "⚡ Redstone"
 }

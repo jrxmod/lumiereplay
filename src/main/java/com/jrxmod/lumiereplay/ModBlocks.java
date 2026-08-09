@@ -1,6 +1,6 @@
 package com.jrxmod.lumiereplay;
 
-import net.fabricmc.fabric.api.object.builder.v1.block.FabricBlockSettings;
+import net.minecraft.block.AbstractBlock;
 import net.minecraft.block.Block;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
@@ -13,7 +13,7 @@ public final class ModBlocks {
     // Projector block - renders a virtual screen and stores playback state
     public static final ProjectorBlock PROJECTOR = register(
         "projector",
-        new ProjectorBlock(FabricBlockSettings.create().strength(3.5f, 4.0f).requiresTool().luminance(state -> 0))
+        new ProjectorBlock(AbstractBlock.Settings.create().strength(3.5f, 4.0f).requiresTool())
     );
 
     /**
