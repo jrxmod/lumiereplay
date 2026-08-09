@@ -1,22 +1,27 @@
 /*
  * Copyright 2026 jrxmod — Lumière Play GUI
- * Clean 8-row layout, no overlapping elements.
+ * Redesigned 0.6.0: larger panel, sectioned layout, history, hotkeys, sounds.
  */
 package com.jrxmod.lumiereplay.client.screen;
 
 import com.jrxmod.lumiereplay.AccessMode;
+import com.jrxmod.lumiereplay.client.LumiereConfig;
 import com.jrxmod.lumiereplay.client.video.PlayerState;
 import com.jrxmod.lumiereplay.client.video.VideoManager;
 import com.jrxmod.lumiereplay.client.ytdlp.UrlResolver;
 import com.jrxmod.lumiereplay.network.ProjectorUpdatePayload;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
+import net.minecraft.client.sound.PositionedSoundInstance;
+import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
+import org.lwjgl.glfw.GLFW;
 
 public class ProjectorScreen extends Screen {
 
@@ -31,41 +36,42 @@ public class ProjectorScreen extends Screen {
     private UrlResolver.Quality selectedQuality = UrlResolver.Quality.P720;
     private int     selectedPreset  = 0;
 
+    // History state
+    private int     historyIndex = -1;  // -1 = current URL, 0+ = history position
+    private String[] historyUrls;
+
     private TextFieldWidget urlField;
     private ButtonWidget    playPauseBtn;
-    private ButtonWidget    stopBtn;
-    private ButtonWidget    restartBtn;
-    private ButtonWidget    volDownBtn;
-    private ButtonWidget    volUpBtn;
+    private VolumeSlider    volumeSlider;
     private SeekSlider      seekSlider;
-    private ButtonWidget    accessBtn;
 
-    // ===== Grid constants =====
-    private static final int PAD   = 10;   // outer panel padding
-    private static final int GAP   = 6;    // gap between widgets in a row
-    private static final int ROW   = 22;   // row height (button/field/slider)
-    private static final int LHGT  = 11;   // label/text height
-    private static final int TITLE_H = 16; // title row height
-    private static final int SEC_GAP = 8;  // vertical gap between sections
+    // ===== Layout constants =====
+    private static final int PW    = 440;
+    private static final int PAD   = 14;
+    private static final int GAP   = 6;
+    private static final int ROW   = 24;
+    private static final int LHGT  = 10;
+    private static final int TITLE_H = 18;
+    private static final int SEC_LABEL_H = 10;
+    private static final int SEC_GAP = 8;
 
-    private static final int PW    = 340;  // panel width
-    private static final int BW_S  = 24;   // small square button (play/pause/stop/restart)
-    private static final int BW_V  = 26;   // volume - and + buttons
-    private static final int BIG_W = 64;   // Play button width
-    private static final int DONE_W = 80;
-    private static final int ACC_W = 140;  // access button
+    // Y positions (computed in init for clarity)
+    private int ySep1, ySrcLabel, ySrcField, ySrcHist;
+    private int ySep2, yPbLabel, yPbBtns, yPbSeek, yPbVol;
+    private int ySep3, yDqLabel, yDqBtns;
+    private int ySep4, yFooter;
+    private int panelH;
 
-    // Vertical Y offsets (top to bottom)
-    private static final int Y_TITLE  = PAD;
-    private static final int Y_SRC    = Y_TITLE + TITLE_H + SEC_GAP;     // row 0: URL + Play
-    private static final int Y_PB     = Y_SRC   + ROW   + SEC_GAP;       // row 1: play/pause/stop/restart
-    private static final int Y_SEEK   = Y_PB    + ROW   + SEC_GAP;       // row 2: seek slider
-    private static final int Y_VOL    = Y_SEEK  + ROW   + SEC_GAP;       // row 3: volume - 100% +
-    private static final int Y_QL     = Y_VOL   + ROW   + SEC_GAP;       // row 4: quality buttons
-    private static final int Y_SZ     = Y_QL    + ROW   + SEC_GAP;       // row 5: size buttons
-    private static final int Y_AC     = Y_SZ    + ROW   + SEC_GAP;       // row 6: access
-    private static final int Y_DONE   = Y_AC    + ROW   + SEC_GAP;       // row 7: Done
-    private static final int PH       = Y_DONE  + ROW   + PAD;           // panel height
+    // Colors
+    private static final int COL_PANEL_BG    = 0xF0181828;
+    private static final int COL_BORDER      = 0xFF2A2A3A;
+    private static final int COL_SEPARATOR   = 0xFF2A2A3A;
+    private static final int COL_TITLE       = 0xFFFFD700;
+    private static final int COL_SECTION     = 0xFF7777AA;
+    private static final int COL_PRIMARY     = 0xFFFFFFFF;
+    private static final int COL_SECONDARY   = 0xFF999999;
+    private static final int COL_HIGHLIGHT_Q = 0x66FFD700;
+    private static final int COL_HIGHLIGHT_S = 0x6600FF88;
 
     private static final int[][] PRESETS        = {{16,9},{32,18},{32,14},{16,12}};
     private static final String[] PRESET_LABELS = {"16:9","32:18","21:9","4:3"};
@@ -82,9 +88,11 @@ public class ProjectorScreen extends Screen {
         this.screenHeight = height;
         this.accessMode   = accessMode != null ? accessMode : AccessMode.ALL;
 
-        String selfUuid = net.minecraft.client.MinecraftClient.getInstance().player != null
-            ? net.minecraft.client.MinecraftClient.getInstance().player.getUuidAsString() : "";
+        String selfUuid = MinecraftClient.getInstance().player != null
+            ? MinecraftClient.getInstance().player.getUuidAsString() : "";
         this.isOwner = ownerUuid.isEmpty() || ownerUuid.equals(selfUuid);
+
+        this.historyUrls = LumiereConfig.getHistoryUrls();
 
         for (int i = 0; i < PRESETS.length; i++) {
             if (PRESETS[i][0] == width && PRESETS[i][1] == height) {
@@ -95,20 +103,54 @@ public class ProjectorScreen extends Screen {
     }
 
     private int px() { return this.width  / 2 - PW / 2; }
-    private int py() { return this.height / 2 - PH / 2; }
+    private int py() { return this.height / 2 - panelH / 2; }
     private int innerW() { return PW - PAD * 2; }
 
     @Override
     protected void init() {
-        int x = px();
-        int y = py();
         int iw = innerW();
+        int x = px();
 
-        // === Row 0: URL field + Play button ===
-        int playW = BIG_W;
+        // Compute Y positions
+        int y = PAD;
+        y += TITLE_H;
+        ySep1 = y;
+        y += SEC_GAP;
+        ySrcLabel = y;
+        y += SEC_LABEL_H + 4;
+        ySrcField = y;
+        y += ROW + 4;
+        ySrcHist = y;
+        y += ROW + 4;
+        ySep2 = y;
+        y += SEC_GAP;
+        yPbLabel = y;
+        y += SEC_LABEL_H + 4;
+        yPbBtns = y;
+        y += ROW + 4;
+        yPbSeek = y;
+        y += ROW + 4;
+        yPbVol = y;
+        y += ROW + 4;
+        ySep3 = y;
+        y += SEC_GAP;
+        yDqLabel = y;
+        y += SEC_LABEL_H + 4;
+        yDqBtns = y;
+        y += ROW + 4;
+        ySep4 = y;
+        y += SEC_GAP;
+        yFooter = y;
+        y += ROW + PAD;
+        panelH = y;
+
+        int py = py();
+
+        // === Source section ===
+        int playW = 60;
         int urlW = iw - playW - GAP;
         urlField = new TextFieldWidget(this.textRenderer,
-            x + PAD, y + Y_SRC, urlW, ROW,
+            x + PAD, py + ySrcField, urlW, ROW,
             Text.translatable("gui.lumiereplay.projector.url_placeholder"));
         urlField.setMaxLength(512);
         urlField.setText(currentUrl);
@@ -117,79 +159,111 @@ public class ProjectorScreen extends Screen {
 
         this.addDrawableChild(ButtonWidget.builder(
             Text.translatable("gui.lumiereplay.projector.play"),
-            btn -> applyAndPlay())
-            .dimensions(x + PAD + urlW + GAP, y + Y_SRC, playW, ROW)
+            btn -> { playClick(); applyAndPlay(); })
+            .dimensions(x + PAD + urlW + GAP, py + ySrcField, playW, ROW)
             .build());
 
-        // === Row 1: play/pause | stop | restart ===
+        // History navigation
+        int histBtnW = 24;
+        int histGap = 4;
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("◀"),
+            btn -> { playClick(); cycleHistory(-1); })
+            .dimensions(x + PAD, py + ySrcHist, histBtnW, ROW)
+            .build());
+
+        int histLabelW = 50;
+        int histLabelX = x + PAD + histBtnW + histGap;
+
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("▶"),
+            btn -> { playClick(); cycleHistory(1); })
+            .dimensions(histLabelX + histLabelW + histGap, py + ySrcHist, histBtnW, ROW)
+            .build());
+
+        // Copy button (right-aligned)
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("⧉"),
+            btn -> {
+                playClick();
+                if (!currentUrl.isEmpty()) {
+                    MinecraftClient.getInstance().keyboard.setClipboard(currentUrl);
+                }
+            })
+            .dimensions(x + PAD + iw - histBtnW, py + ySrcHist, histBtnW, ROW)
+            .build());
+
+        // === Playback buttons ===
+        int bw = 28;
+        int bg = 6;
         playPauseBtn = ButtonWidget.builder(
             Text.translatable(isPlaying
                 ? "gui.lumiereplay.projector.pause"
                 : "gui.lumiereplay.projector.resume"),
-            btn -> {
-                isPlaying = !isPlaying;
-                btn.setMessage(Text.translatable(isPlaying
-                    ? "gui.lumiereplay.projector.pause"
-                    : "gui.lumiereplay.projector.resume"));
-                if (isPlaying) VideoManager.resume(pos); else VideoManager.pause(pos);
-                sendStateOnly();
-            })
-            .dimensions(x + PAD, y + Y_PB, BW_S, ROW)
+            btn -> { playClick(); togglePause(); })
+            .dimensions(x + PAD, py + yPbBtns, bw, ROW)
             .build();
         this.addDrawableChild(playPauseBtn);
 
-        stopBtn = ButtonWidget.builder(
+        this.addDrawableChild(ButtonWidget.builder(
             Text.translatable("gui.lumiereplay.projector.stop"),
             btn -> {
+                playClick();
                 isPlaying  = false;
                 currentUrl = "";
                 urlField.setText("");
+                historyIndex = -1;
                 playPauseBtn.setMessage(Text.translatable("gui.lumiereplay.projector.resume"));
                 VideoManager.update(pos, "", false, volume);
                 sendStateOnly();
             })
-            .dimensions(x + PAD + (BW_S + GAP), y + Y_PB, BW_S, ROW)
-            .build();
-        this.addDrawableChild(stopBtn);
+            .dimensions(x + PAD + (bw + bg), py + yPbBtns, bw, ROW)
+            .build());
 
-        restartBtn = ButtonWidget.builder(
-            Text.literal("\u21BB"),
-            btn -> VideoManager.restart(pos))
-            .dimensions(x + PAD + (BW_S + GAP) * 2, y + Y_PB, BW_S, ROW)
-            .build();
-        this.addDrawableChild(restartBtn);
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("↻"),
+            btn -> { playClick(); VideoManager.restart(pos); })
+            .dimensions(x + PAD + (bw + bg) * 2, py + yPbBtns, bw, ROW)
+            .build());
 
-        // === Row 2: Seek slider (full width) ===
-        seekSlider = new SeekSlider(x + PAD, y + Y_SEEK, iw, ROW);
+        // === Seek slider ===
+        seekSlider = new SeekSlider(x + PAD, py + yPbSeek, iw, ROW);
         this.addDrawableChild(seekSlider);
 
-        // === Row 3: Volume (- 100% +) ===
-        volDownBtn = ButtonWidget.builder(
-            Text.literal("-"),
-            btn -> { volume = Math.max(0, volume - 10);
-                    VideoManager.updateVolume(pos, volume); sendStateOnly(); })
-            .dimensions(x + PAD, y + Y_VOL, BW_V, ROW)
-            .build();
-        this.addDrawableChild(volDownBtn);
+        // === Volume slider ===
+        volumeSlider = new VolumeSlider(x + PAD, py + yPbVol, iw, ROW);
+        this.addDrawableChild(volumeSlider);
 
-        volUpBtn = ButtonWidget.builder(
-            Text.literal("+"),
-            btn -> { volume = Math.min(100, volume + 10);
-                    VideoManager.updateVolume(pos, volume); sendStateOnly(); })
-            .dimensions(x + PAD + iw - BW_V, y + Y_VOL, BW_V, ROW)
-            .build();
-        this.addDrawableChild(volUpBtn);
-        // "100%" label drawn in render() between the two buttons
+        // === Display presets (left half) ===
+        int halfW = (iw - 20) / 2;
+        int sw = (halfW - (PRESETS.length - 1) * 4) / PRESETS.length;
+        for (int i = 0; i < PRESETS.length; i++) {
+            final int idx = i;
+            this.addDrawableChild(ButtonWidget.builder(
+                Text.literal(PRESET_LABELS[i]),
+                btn -> {
+                    playClick();
+                    selectedPreset = idx;
+                    screenWidth    = PRESETS[idx][0];
+                    screenHeight   = PRESETS[idx][1];
+                    sendStateOnly();
+                })
+                .dimensions(x + PAD + i * (sw + 4), py + yDqBtns, sw, ROW)
+                .build());
+        }
 
-        // === Row 4: Quality buttons (5 buttons) ===
+        // === Quality buttons (right half) ===
         UrlResolver.Quality[] qs = UrlResolver.Quality.values();
-        int qgap = 4;
-        int qw = (iw - (qs.length - 1) * qgap) / qs.length;
+        int qStart = x + PAD + halfW + 20;
+        int qArea = iw - halfW - 20;
+        int qgap = 3;
+        int qw = (qArea - (qs.length - 1) * qgap) / qs.length;
         for (int i = 0; i < qs.length; i++) {
             final UrlResolver.Quality q = qs[i];
             this.addDrawableChild(ButtonWidget.builder(
                 Text.literal(q.label),
                 btn -> {
+                    playClick();
                     if (selectedQuality != q) {
                         selectedQuality = q;
                         if (isPlaying && !currentUrl.isEmpty()) {
@@ -198,124 +272,168 @@ public class ProjectorScreen extends Screen {
                         }
                     }
                 })
-                .dimensions(x + PAD + i * (qw + qgap), y + Y_QL, qw, ROW)
+                .dimensions(qStart + i * (qw + qgap), py + yDqBtns, qw, ROW)
                 .build());
         }
 
-        // === Row 5: Size presets (4 buttons) ===
-        int sw = (iw - (PRESETS.length - 1) * 4) / PRESETS.length;
-        for (int i = 0; i < PRESETS.length; i++) {
-            final int idx = i;
-            this.addDrawableChild(ButtonWidget.builder(
-                Text.literal(PRESET_LABELS[i]),
-                btn -> {
-                    selectedPreset = idx;
-                    screenWidth    = PRESETS[idx][0];
-                    screenHeight   = PRESETS[idx][1];
-                    sendStateOnly();
-                })
-                .dimensions(x + PAD + i * (sw + 4), y + Y_SZ, sw, ROW)
-                .build());
-        }
-
-        // === Row 6: Access mode (only if owner) ===
+        // === Footer: Access + Done ===
+        int doneW = 80;
         if (isOwner) {
-            accessBtn = ButtonWidget.builder(
+            this.addDrawableChild(ButtonWidget.builder(
                 Text.translatable("gui.lumiereplay.projector.access", accessMode.id),
                 btn -> {
+                    playClick();
                     AccessMode[] modes = AccessMode.values();
                     accessMode = modes[(accessMode.ordinal() + 1) % modes.length];
                     btn.setMessage(Text.translatable("gui.lumiereplay.projector.access", accessMode.id));
                     sendStateOnly();
                 })
-                .dimensions(x + PAD, y + Y_AC, ACC_W, ROW)
-                .build();
-            this.addDrawableChild(accessBtn);
+                .dimensions(x + PAD, py + yFooter, 140, ROW)
+                .build());
         }
 
-        // === Row 7: Done button (centered) ===
         this.addDrawableChild(ButtonWidget.builder(
             Text.translatable("gui.done"),
-            btn -> this.close())
-            .dimensions(x + PW / 2 - DONE_W / 2, y + Y_DONE, DONE_W, ROW)
+            btn -> { playClick(); this.close(); })
+            .dimensions(x + PW - PAD - doneW, py + yFooter, doneW, ROW)
             .build());
     }
 
     @Override
-    public void renderBackground(DrawContext ctx, int mouseX, int mouseY, float delta) {}
-
-    @Override
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+        seekSlider.refresh();
+        super.render(ctx, mouseX, mouseY, delta);
+
         int x = px();
         int y = py();
+        int iw = innerW();
 
-        // Panel background + gold accent
-        ctx.fill(x, y, x + PW, y + PH, 0xF0101018);
-        ctx.fill(x, y, x + PW, y + 2, 0xFFFFD700);
-        ctx.fill(x,         y + 2, x + 1,      y + PH, 0xFF444455);
-        ctx.fill(x + PW - 1, y + 2, x + PW,     y + PH, 0xFF444455);
-        ctx.fill(x,         y + PH - 1, x + PW, y + PH, 0xFF444455);
+        // Panel background
+        ctx.fill(x, y, x + PW, y + panelH, COL_PANEL_BG);
+        // Border
+        ctx.fill(x, y, x + PW, y + 1, COL_BORDER);
+        ctx.fill(x, y + panelH - 1, x + PW, y + panelH, COL_BORDER);
+        ctx.fill(x, y, x + 1, y + panelH, COL_BORDER);
+        ctx.fill(x + PW - 1, y, x + PW, y + panelH, COL_BORDER);
 
-        // Title (top-left)
+        // Title
         ctx.drawTextWithShadow(this.textRenderer,
             Text.translatable("gui.lumiereplay.projector.title"),
-            x + PAD, y + Y_TITLE + 3, 0xFFFFD700);
+            x + PAD, y + PAD + 4, COL_TITLE);
 
-        // Status (top-right, same row as title)
+        // Status with pulsing dot
         PlayerState pstate = VideoManager.getState(pos);
         String stateKey = "gui.lumiereplay.status." + pstate.name().toLowerCase();
         Text stTxt = Text.translatable(stateKey);
-        int stCol = switch (pstate) {
+        int stCol = getStatusColor(pstate);
+        int stW = textRenderer.getWidth(stTxt);
+        int stX = x + PW - PAD - stW;
+        int stY = y + PAD + 4;
+        ctx.drawTextWithShadow(this.textRenderer, stTxt, stX, stY, stCol);
+
+        // Pulsing dot for PLAYING
+        if (pstate == PlayerState.PLAYING) {
+            float pulse = (float)((Math.sin(System.currentTimeMillis() / 300.0) + 1.0) / 2.0);
+            int alpha = (int)(100 + pulse * 155);
+            int dotCol = (alpha << 24) | (stCol & 0x00FFFFFF);
+            ctx.fill(stX - 10, stY + 3, stX - 4, stY + 9, dotCol);
+        }
+
+        // Separators
+        ctx.fill(x + PAD, y + ySep1, x + PW - PAD, y + ySep1 + 1, COL_SEPARATOR);
+        ctx.fill(x + PAD, y + ySep2, x + PW - PAD, y + ySep2 + 1, COL_SEPARATOR);
+        ctx.fill(x + PAD, y + ySep3, x + PW - PAD, y + ySep3 + 1, COL_SEPARATOR);
+        ctx.fill(x + PAD, y + ySep4, x + PW - PAD, y + ySep4 + 1, COL_SEPARATOR);
+
+        // Section labels
+        ctx.drawTextWithShadow(this.textRenderer,
+            Text.literal("SOURCE"),
+            x + PAD, y + ySrcLabel, COL_SECTION);
+        ctx.drawTextWithShadow(this.textRenderer,
+            Text.literal("PLAYBACK"),
+            x + PAD, y + yPbLabel, COL_SECTION);
+
+        int halfW = (iw - 20) / 2;
+        ctx.drawTextWithShadow(this.textRenderer,
+            Text.literal("DISPLAY"),
+            x + PAD, y + yDqLabel, COL_SECTION);
+        ctx.drawTextWithShadow(this.textRenderer,
+            Text.literal("QUALITY"),
+            x + PAD + halfW + 20, y + yDqLabel, COL_SECTION);
+
+        // History counter
+        String histLabel;
+        if (historyUrls.length == 0) {
+            histLabel = "—";
+        } else if (historyIndex < 0) {
+            histLabel = "— / " + historyUrls.length;
+        } else {
+            histLabel = (historyIndex + 1) + " / " + historyUrls.length;
+        }
+        int histBtnW = 24;
+        int histGap = 4;
+        int histLabelW = 50;
+        int histLabelX = x + PAD + histBtnW + histGap;
+        ctx.drawCenteredTextWithShadow(this.textRenderer,
+            Text.literal(histLabel),
+            histLabelX + histLabelW / 2, y + ySrcHist + (ROW - LHGT) / 2 + 1, COL_SECONDARY);
+
+        // Quality highlight
+        UrlResolver.Quality[] qs = UrlResolver.Quality.values();
+        int qStart = x + PAD + halfW + 20;
+        int qArea = iw - halfW - 20;
+        int qgap = 3;
+        int qw = (qArea - (qs.length - 1) * qgap) / qs.length;
+        for (int i = 0; i < qs.length; i++) {
+            if (qs[i] == selectedQuality) {
+                ctx.fill(qStart + i * (qw + qgap),      y + yDqBtns,
+                         qStart + i * (qw + qgap) + qw, y + yDqBtns + ROW,
+                         COL_HIGHLIGHT_Q);
+            }
+        }
+
+        // Size preset highlight
+        int sw = (halfW - (PRESETS.length - 1) * 4) / PRESETS.length;
+        ctx.fill(x + PAD + selectedPreset * (sw + 4),      y + yDqBtns,
+                 x + PAD + selectedPreset * (sw + 4) + sw, y + yDqBtns + ROW,
+                 COL_HIGHLIGHT_S);
+
+        // Size text
+        String sizeTxt = screenWidth + "×" + screenHeight;
+        int sizeTxtX = x + PAD + halfW - textRenderer.getWidth(sizeTxt);
+        if (sizeTxtX > x + PAD + PRESETS.length * (sw + 4)) {
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal(sizeTxt),
+                sizeTxtX, y + yDqBtns + (ROW - LHGT) / 2 + 1, 0xFF44FF88);
+        }
+
+        // Access locked warning
+        if (!isOwner) {
+            ctx.drawTextWithShadow(this.textRenderer,
+                Text.translatable("gui.lumiereplay.projector.access_locked"),
+                x + PAD, y + yFooter + (ROW - LHGT) / 2 + 1, COL_SECONDARY);
+        }
+    }
+
+    private static int getStatusColor(PlayerState state) {
+        return switch (state) {
             case PLAYING   -> 0xFF44FF88;
-            case PAUSED    -> 0xFFFFD700;
+            case PAUSED    -> 0xFFFFAA44;
             case LOADING   -> 0xFF4488FF;
             case RESOLVING -> 0xFF9966FF;
             case ERROR     -> 0xFFFF4444;
             default        -> 0xFF888888;
         };
-        ctx.drawTextWithShadow(this.textRenderer, stTxt,
-            x + PW - PAD - textRenderer.getWidth(stTxt), y + Y_TITLE + 3, stCol);
+    }
 
-        // Volume label — drawn in the GAP between - and + buttons (no overlap)
-        int iw = innerW();
-        int volLabelX = x + PAD + BW_V + (iw - BW_V * 2) / 2;
-        ctx.drawCenteredTextWithShadow(this.textRenderer,
-            Text.translatable("gui.lumiereplay.projector.volume", volume),
-            volLabelX, y + Y_VOL + (ROW - LHGT) / 2 + 1, 0xFFFFFFFF);
+    // === Actions ===
 
-        // Quality highlight
-        UrlResolver.Quality[] qs = UrlResolver.Quality.values();
-        int qgap = 4;
-        int qw = (iw - (qs.length - 1) * qgap) / qs.length;
-        for (int i = 0; i < qs.length; i++) {
-            if (qs[i] == selectedQuality) {
-                ctx.fill(x + PAD + i * (qw + qgap),      y + Y_QL,
-                         x + PAD + i * (qw + qgap) + qw, y + Y_QL + ROW,
-                         0x99FFD700);
-            }
-        }
-
-        // Size preset highlight
-        int sw = (iw - (PRESETS.length - 1) * 4) / PRESETS.length;
-        ctx.fill(x + PAD + selectedPreset * (sw + 4),      y + Y_SZ,
-                 x + PAD + selectedPreset * (sw + 4) + sw, y + Y_SZ + ROW,
-                 0x9900FF88);
-        // Size text on the right (if width allows)
-        String sizeTxt = screenWidth + "x" + screenHeight;
-        if (textRenderer.getWidth(sizeTxt) < (PW - PAD - (x + PAD + 4 * (sw + 4) - x - PAD))) {
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal(sizeTxt),
-                x + PW - PAD - textRenderer.getWidth(sizeTxt),
-                y + Y_SZ + (ROW - LHGT) / 2 + 1, 0xFF44FF88);
-        }
-
-        // Access locked warning (if not owner) — placed to the right of the access button
-        if (!isOwner) {
-            ctx.drawTextWithShadow(this.textRenderer,
-                Text.translatable("gui.lumiereplay.projector.access_locked"),
-                x + PAD + ACC_W + 8, y + Y_AC + (ROW - LHGT) / 2 + 1, 0xFF666666);
-        }
-
-        super.render(ctx, mouseX, mouseY, delta);
+    private void togglePause() {
+        isPlaying = !isPlaying;
+        playPauseBtn.setMessage(Text.translatable(isPlaying
+            ? "gui.lumiereplay.projector.pause"
+            : "gui.lumiereplay.projector.resume"));
+        if (isPlaying) VideoManager.resume(pos); else VideoManager.pause(pos);
+        sendStateOnly();
     }
 
     private void applyAndPlay() {
@@ -324,8 +442,25 @@ public class ProjectorScreen extends Screen {
         currentUrl = url;
         isPlaying  = true;
         playPauseBtn.setMessage(Text.translatable("gui.lumiereplay.projector.pause"));
+        LumiereConfig.addHistoryUrl(url);
+        historyUrls = LumiereConfig.getHistoryUrls();
+        historyIndex = -1;
         VideoManager.update(pos, url, true, volume, selectedQuality);
         sendStateOnly();
+    }
+
+    private void cycleHistory(int direction) {
+        if (historyUrls.length == 0) return;
+        if (historyIndex < 0) {
+            historyIndex = direction > 0 ? 0 : historyUrls.length - 1;
+        } else {
+            historyIndex += direction;
+            if (historyIndex >= historyUrls.length) historyIndex = 0;
+            if (historyIndex < 0) historyIndex = historyUrls.length - 1;
+        }
+        String url = historyUrls[historyIndex];
+        currentUrl = url;
+        urlField.setText(url);
     }
 
     private void sendStateOnly() {
@@ -333,23 +468,92 @@ public class ProjectorScreen extends Screen {
             pos, currentUrl, isPlaying, volume, screenWidth, screenHeight, accessMode));
     }
 
-    /** Slider for seeking — disables itself on live streams. */
+    private void playClick() {
+        MinecraftClient.getInstance().getSoundManager()
+            .play(PositionedSoundInstance.master(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+    }
+
+    // === Hotkeys ===
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (urlField.isFocused()) return super.keyPressed(keyCode, scanCode, modifiers);
+
+        if (keyCode == GLFW.GLFW_KEY_SPACE) {
+            togglePause();
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_LEFT) {
+            long cur = VideoManager.getPositionMs(pos);
+            if (cur < 0) {
+                showSeekError("Position unknown");
+                return true;
+            }
+            boolean ok = VideoManager.seekTo(pos, Math.max(0, cur - 5000));
+            if (!ok) showSeekError("Seek not supported");
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_RIGHT) {
+            long cur = VideoManager.getPositionMs(pos);
+            long len = VideoManager.getLengthMs(pos);
+            if (cur < 0 || len <= 0) {
+                showSeekError(len <= 0 ? "Live stream" : "Position unknown");
+                return true;
+            }
+            boolean ok = VideoManager.seekTo(pos, Math.min(len, cur + 5000));
+            if (!ok) showSeekError("Seek not supported");
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    private void showSeekError(String msg) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            mc.player.sendMessage(
+                net.minecraft.text.Text.literal(msg).formatted(net.minecraft.util.Formatting.YELLOW), true);
+        }
+    }
+
+    // === Sliders ===
+
+    /** Seek slider — disables itself on live streams, shows buffering %. */
     private class SeekSlider extends SliderWidget {
         private boolean seekable = true;
         SeekSlider(int x, int y, int w, int h) {
             super(x, y, w, h, Text.literal("0:00 / 0:00"), 0.0);
         }
+        public void refresh() {
+            updateMessage();
+        }
         @Override protected void updateMessage() {
             long posMs = VideoManager.getPositionMs(ProjectorScreen.this.pos);
             long lenMs = VideoManager.getLengthMs(ProjectorScreen.this.pos);
+            int buf = VideoManager.getBufferPercent(ProjectorScreen.this.pos);
+            PlayerState pstate = VideoManager.getState(ProjectorScreen.this.pos);
+            boolean isLoading = pstate == PlayerState.LOADING || pstate == PlayerState.RESOLVING;
+
             if (lenMs <= 0) {
                 seekable = false;
-                setMessage(Text.translatable("gui.lumiereplay.projector.live"));
+                String liveLabel = Text.translatable("gui.lumiereplay.projector.live").getString();
+                if (isLoading || (buf > 0 && buf < 100)) {
+                    String bufLabel = buf > 0 ? "Buffering " + buf + "%" : "Buffering...";
+                    setMessage(Text.literal(liveLabel + "  •  " + bufLabel));
+                } else {
+                    setMessage(Text.literal(liveLabel));
+                }
                 return;
             }
             seekable = true;
-            this.value = (double) posMs / (double) lenMs;
-            setMessage(Text.literal(formatTime(posMs) + " / " + formatTime(lenMs)));
+            this.value = lenMs > 0 ? (double) posMs / (double) lenMs : 0.0;
+
+            String timeLabel = formatTime(posMs) + " / " + formatTime(lenMs);
+            if (isLoading || (buf > 0 && buf < 100)) {
+                String bufLabel = buf > 0 ? "Buffering " + buf + "%" : "Buffering...";
+                setMessage(Text.literal(timeLabel + "     " + bufLabel));
+            } else {
+                setMessage(Text.literal(timeLabel));
+            }
         }
         @Override protected void applyValue() {
             if (!seekable) return;
@@ -357,6 +561,24 @@ public class ProjectorScreen extends Screen {
             if (lenMs > 0) VideoManager.seekTo(ProjectorScreen.this.pos, (long)(value * lenMs));
         }
     }
+
+    /** Volume slider — replaces +/- buttons. */
+    private class VolumeSlider extends SliderWidget {
+        VolumeSlider(int x, int y, int w, int h) {
+            super(x, y, w, h, Text.literal(""), volume / 100.0);
+            updateMessage();
+        }
+        @Override protected void updateMessage() {
+            setMessage(Text.literal("🔊  " + ProjectorScreen.this.volume + "%"));
+        }
+        @Override protected void applyValue() {
+            ProjectorScreen.this.volume = (int)(value * 100);
+            VideoManager.updateVolume(ProjectorScreen.this.pos, ProjectorScreen.this.volume);
+            ProjectorScreen.this.sendStateOnly();
+        }
+    }
+
+    // === Helpers ===
 
     private static String formatTime(long ms) {
         if (ms < 0) ms = 0;

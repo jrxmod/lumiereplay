@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Tracks one VideoPlayer per projector BlockPos.
@@ -18,13 +19,13 @@ import java.util.Set;
  */
 public class VideoManager {
 
-    private static final Map<BlockPos, VideoPlayer>        players       = new HashMap<>();
-    private static final Set<BlockPos>                     pending       = new HashSet<>();
-    private static final Map<BlockPos, UrlResolver.Quality> activeQuality  = new HashMap<>();
-    private static final Map<BlockPos, Integer>             retryCount     = new HashMap<>();
-    private static final Map<BlockPos, String>              retryOrigin    = new HashMap<>();
-    private static final Map<BlockPos, UrlResolver.Quality> retryQuality   = new HashMap<>();
-    private static final Set<BlockPos>                      lazyPaused     = new HashSet<>();
+    private static final Map<BlockPos, VideoPlayer>        players       = new ConcurrentHashMap<>();
+    private static final Set<BlockPos>                     pending       = ConcurrentHashMap.newKeySet();
+    private static final Map<BlockPos, UrlResolver.Quality> activeQuality  = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, Integer>             retryCount     = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, String>              retryOrigin    = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, UrlResolver.Quality> retryQuality   = new ConcurrentHashMap<>();
+    private static final Set<BlockPos>                      lazyPaused     = ConcurrentHashMap.newKeySet();
 
     private static final int[]  RETRY_DELAYS_SEC = {2, 5, 15};
     private static final int    MAX_RETRIES      = 3;
@@ -272,7 +273,7 @@ public class VideoManager {
         UrlResolver.resolveAsync(origin, q, resolved -> {
             try {
                 VideoPlayer np = new VideoPlayer(resolved, tex, p);
-                np.setOnRetry(null);  // no auto-retry on manual restart
+                np.setOnRetry(buildRetryCallback(p));
                 players.put(p, np);
                 np.play();
             } catch (Exception e) {
@@ -291,6 +292,11 @@ public class VideoManager {
     public static long getLengthMs(BlockPos pos) {
         VideoPlayer p = players.get(pos);
         return p == null ? -1 : p.getLengthMs();
+    }
+
+    public static int getBufferPercent(BlockPos pos) {
+        VideoPlayer p = players.get(pos);
+        return p == null ? 0 : p.getBufferPercent();
     }
 
     public static boolean seekTo(BlockPos pos, long ms) {

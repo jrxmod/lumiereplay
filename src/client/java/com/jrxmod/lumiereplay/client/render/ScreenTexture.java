@@ -263,6 +263,7 @@ public class ScreenTexture implements AutoCloseable {
         closed        = true;
         nativePointer = 0L;
         unregister();
+        if (texture != null) { texture.close(); texture = null; }
         if (image != null) { image.close(); image = null; }
     }
 }

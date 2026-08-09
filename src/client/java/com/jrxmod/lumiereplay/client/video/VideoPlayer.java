@@ -48,6 +48,7 @@ public class VideoPlayer implements AutoCloseable {
     private volatile int         targetVolume    = 100;
     private          int         frameCounter    = 0;
     private volatile boolean     firstFrameReceived  = false;
+    private volatile int         bufferPercent       = 0;
     private volatile Runnable     onRetry             = null;
     private          Timer       firstFrameTimer     = null;
 
@@ -152,6 +153,7 @@ public class VideoPlayer implements AutoCloseable {
 
                 @Override
                 public void buffering(MediaPlayer mp, float newCache) {
+                    bufferPercent = (int) newCache;
                     // Never overwrite PAUSED state — buffering events fire during pause too
                     if (state != PlayerState.PAUSED && newCache < 100f) {
                         state = PlayerState.LOADING;
@@ -204,11 +206,14 @@ public class VideoPlayer implements AutoCloseable {
         this.targetVolume = Math.max(0, Math.min(100, vol));
         if (mediaPlayer != null) {
             float spatial = ProjectorSound.getEffectiveVolume(projectorPos);
-            mediaPlayer.audio().setVolume((int)(targetVolume * spatial));
+            // Apply square-root curve for perceptual loudness
+            int curvedVol = (int)(Math.sqrt(targetVolume / 100.0) * 100);
+            mediaPlayer.audio().setVolume((int)(curvedVol * spatial));
         }
     }
 
     public PlayerState getState() { return state; }
+    public int getBufferPercent() { return bufferPercent; }
 
     public void setOnRetry(Runnable r) { this.onRetry = r; }
 
@@ -308,7 +313,15 @@ public class VideoPlayer implements AutoCloseable {
     /** Seeks to position in milliseconds. Returns false if not seekable (HLS live). */
     public boolean setPositionMs(long ms) {
         if (mediaPlayer == null) return false;
-        try { mediaPlayer.controls().setTime(ms); return true; } catch (Exception e) { return false; }
+        try {
+            long len = mediaPlayer.status().length();
+            if (len > 0) {
+                mediaPlayer.controls().setPosition((float) ms / len);
+            } else {
+                mediaPlayer.controls().setTime(ms);
+            }
+            return true;
+        } catch (Exception e) { return false; }
     }
 
     /** Full restart: stop + re-play the same source. Works for HLS where setPosition fails. */

@@ -7,6 +7,8 @@ import net.fabricmc.loader.api.FabricLoader;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Persistent JSON config for the Lumiere Play mod.
@@ -17,6 +19,7 @@ public class LumiereConfig {
     public Audio   audio  = new Audio();
     public Lazy    lazy   = new Lazy();
     public Network network = new Network();
+    public History history = new History();
 
     public static class Screen {
         public float bezel_size = 0.06f;
@@ -32,6 +35,10 @@ public class LumiereConfig {
     public static class Network {
         public String proxy = "";
         public String[] vlc_args = new String[0];
+    }
+    public static class History {
+        public String[] urls = new String[0];
+        public int max_entries = 5;
     }
 
     private static LumiereConfig INSTANCE;
@@ -60,6 +67,28 @@ public class LumiereConfig {
         } catch (IOException e) {
             System.err.println("[LumierePlay] Failed to write default config: " + e.getMessage());
         }
+    }
+
+    /**
+     * Adds a URL to the front of the history, removes duplicates,
+     * and trims to max_entries. Persists the config immediately.
+     */
+    public static synchronized void addHistoryUrl(String url) {
+        if (url == null || url.isEmpty()) return;
+        LumiereConfig cfg = get();
+        List<String> list = new ArrayList<>();
+        list.add(url);
+        for (String existing : cfg.history.urls) {
+            if (!existing.equals(url) && list.size() < cfg.history.max_entries) {
+                list.add(existing);
+            }
+        }
+        cfg.history.urls = list.toArray(new String[0]);
+        save();
+    }
+
+    public static String[] getHistoryUrls() {
+        return get().history.urls;
     }
 
     public static synchronized void save() {
