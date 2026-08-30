@@ -1,5 +1,6 @@
 package com.jrxmod.lumiereplay.client.sound;
 
+import com.jrxmod.lumiereplay.client.LumiereConfig;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Vec3d;
@@ -13,8 +14,21 @@ import java.util.Map;
  */
 public class ProjectorSound {
 
+    /** Within this distance from the block the sound plays at full volume. */
     private static final float FULL_VOLUME_RADIUS = 8f;
-    private static final float MAX_RADIUS         = 32f;
+
+    /** Fallback cutoff used when the config value is unusable. */
+    private static final float MAX_RADIUS = 32f;
+
+    /**
+     * Distance where attenuation reaches silence, read from config on every call
+     * so an edit applies without restarting the game. Values below the full
+     * volume radius are ignored, otherwise the fade would be inverted.
+     */
+    private static float maxRadius() {
+        float configured = LumiereConfig.get().audio.max_distance;
+        return configured > FULL_VOLUME_RADIUS ? configured : MAX_RADIUS;
+    }
 
     private static final Map<BlockPos, Integer> baseVolumes = new HashMap<>();
 
@@ -39,10 +53,10 @@ public class ProjectorSound {
         float spatial;
         if (dist <= FULL_VOLUME_RADIUS) {
             spatial = 1.0f;
-        } else if (dist >= MAX_RADIUS) {
+        } else if (dist >= maxRadius()) {
             spatial = 0.0f;
         } else {
-            spatial = 1.0f - (float)(dist - FULL_VOLUME_RADIUS) / (MAX_RADIUS - FULL_VOLUME_RADIUS);
+            spatial = 1.0f - (float)(dist - FULL_VOLUME_RADIUS) / (maxRadius() - FULL_VOLUME_RADIUS);
         }
 
         return (base / 100f) * spatial;

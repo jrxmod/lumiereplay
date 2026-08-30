@@ -1,16 +1,18 @@
 /*
  * Copyright 2026 jrxmod — Lumière Play GUI
- * Redesigned 0.6.0: larger panel, sectioned layout, history, hotkeys, sounds.
+ * Sectioned layout with history, hotkeys and sounds. Playback commands carry
+ * the quality choice and seek requests, so the panel controls every viewer.
  */
 package com.jrxmod.lumiereplay.client.screen;
 
 import com.jrxmod.lumiereplay.AccessMode;
+import com.jrxmod.lumiereplay.ProjectorBlockEntity;
 import com.jrxmod.lumiereplay.client.LumiereConfig;
+import com.jrxmod.lumiereplay.client.net.ProjectorClientNet;
 import com.jrxmod.lumiereplay.client.video.PlayerState;
+import com.jrxmod.lumiereplay.client.video.SyncClock;
 import com.jrxmod.lumiereplay.client.video.VideoManager;
 import com.jrxmod.lumiereplay.client.ytdlp.UrlResolver;
-import com.jrxmod.lumiereplay.network.ProjectorUpdatePayload;
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -20,6 +22,7 @@ import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
+import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
 import org.lwjgl.glfw.GLFW;
 
@@ -76,9 +79,13 @@ public class ProjectorScreen extends Screen {
     private static final int[][] PRESETS        = {{16,9},{32,18},{32,14},{16,12}};
     private static final String[] PRESET_LABELS = {"16:9","32:18","21:9","4:3"};
 
+    /** Size of one ← / → jump, in milliseconds. */
+    private static final long SEEK_STEP_MS = 5_000L;
+
     public ProjectorScreen(BlockPos pos, String url, boolean playing,
                            int volume, int width, int height,
-                           AccessMode accessMode, String ownerUuid) {
+                           AccessMode accessMode, String ownerUuid,
+                           String qualityKey) {
         super(Text.translatable("gui.lumiereplay.projector.title"));
         this.pos          = pos;
         this.currentUrl   = url;
@@ -87,6 +94,15 @@ public class ProjectorScreen extends Screen {
         this.screenWidth  = width;
         this.screenHeight = height;
         this.accessMode   = accessMode != null ? accessMode : AccessMode.ALL;
+
+        this.selectedQuality = UrlResolver.Quality.fromKey(qualityKey);
+
+        // A projector nobody has played yet still holds the built in defaults, so
+        // the configured start volume applies to it. Anything already in use keeps
+        // its stored value untouched.
+        if (url.isEmpty() && !playing && volume == 100) {
+            this.volume = LumiereConfig.get().audio.volume;
+        }
 
         String selfUuid = MinecraftClient.getInstance().player != null
             ? MinecraftClient.getInstance().player.getUuidAsString() : "";
@@ -215,6 +231,7 @@ public class ProjectorScreen extends Screen {
                 historyIndex = -1;
                 playPauseBtn.setMessage(Text.translatable("gui.lumiereplay.projector.resume"));
                 VideoManager.update(pos, "", false, volume);
+                SyncClock.reset(pos);
                 sendStateOnly();
             })
             .dimensions(x + PAD + (bw + bg), py + yPbBtns, bw, ROW)
@@ -222,8 +239,29 @@ public class ProjectorScreen extends Screen {
 
         this.addDrawableChild(ButtonWidget.builder(
             Text.literal("↻"),
-            btn -> { playClick(); VideoManager.restart(pos); })
+            btn -> {
+                playClick();
+                VideoManager.restart(pos);
+                // A restart is a new start for the group too: leaving the shared
+                // timeline where it was would drag every viewer back to it.
+                SyncClock.reanchor(pos, 0L);
+            })
             .dimensions(x + PAD + (bw + bg) * 2, py + yPbBtns, bw, ROW)
+            .build());
+
+        // Push this viewer's position onto the shared timeline for everyone else.
+        this.addDrawableChild(ButtonWidget.builder(
+            Text.literal("⏱"),
+            btn -> {
+                playClick();
+                long cur = localPositionMs();
+                if (cur < 0) { showSeekError("gui.lumiereplay.message.position_unknown"); return; }
+                if (VideoManager.getLengthMs(pos) <= 0) {
+                    showSeekError("gui.lumiereplay.message.seek_no_timeline"); return;
+                }
+                SyncClock.reanchor(pos, cur);
+            })
+            .dimensions(x + PAD + (bw + bg) * 3, py + yPbBtns, bw, ROW)
             .build());
 
         // === Seek slider ===
@@ -264,13 +302,15 @@ public class ProjectorScreen extends Screen {
                 Text.literal(q.label),
                 btn -> {
                     playClick();
-                    if (selectedQuality != q) {
-                        selectedQuality = q;
-                        if (isPlaying && !currentUrl.isEmpty()) {
-                            VideoManager.update(pos, "", false, volume);
-                            applyAndPlay();
-                        }
+                    if (selectedQuality == q) return;
+                    selectedQuality = q;
+                    // Only the command re-resolves the stream. Submitting state here
+                    // used to restart the local player through the sync echo, because
+                    // quality was not part of the packet at all.
+                    if (isPlaying && !currentUrl.isEmpty()) {
+                        VideoManager.update(pos, currentUrl, true, volume, q);
                     }
+                    sendStateOnly();
                 })
                 .dimensions(qStart + i * (qw + qgap), py + yDqBtns, qw, ROW)
                 .build());
@@ -331,6 +371,31 @@ public class ProjectorScreen extends Screen {
         int stY = y + PAD + 4;
         ctx.drawTextWithShadow(this.textRenderer, stTxt, stX, stY, stCol);
 
+        int badgeRight = stX - 14;
+
+        // Shared timeline gap, shown only when this client can actually align to
+        // it: without a known media duration the shared value cannot be reached,
+        // so displaying it would only show a number nobody can act on.
+        if (SyncClock.hasClock(pos) && VideoManager.getLengthMs(pos) > 0) {
+            long drift = SyncClock.driftMs(pos) / 1000L;
+            String driftText = Math.abs(drift) < 1
+                ? Text.translatable("gui.lumiereplay.projector.sync_ok").getString()
+                : Text.translatable("gui.lumiereplay.projector.sync",
+                        (drift > 0 ? "+" : "") + drift + "s").getString();
+            int driftColor = Math.abs(drift) < 2 ? COL_SECONDARY : 0xFFFFAA44;
+            int driftW = textRenderer.getWidth(driftText);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal(driftText),
+                badgeRight - driftW, stY, driftColor);
+            badgeRight -= driftW + 10;
+        }
+
+        // Redstone indicator, read live from the block entity
+        if (isRedstonePowered()) {
+            Text redstone = Text.translatable("gui.lumiereplay.projector.redstone_active");
+            int rW = textRenderer.getWidth(redstone);
+            ctx.drawTextWithShadow(this.textRenderer, redstone, badgeRight - rW, stY, 0xFFFF6666);
+        }
+
         // Pulsing dot for PLAYING
         if (pstate == PlayerState.PLAYING) {
             float pulse = (float)((Math.sin(System.currentTimeMillis() / 300.0) + 1.0) / 2.0);
@@ -347,19 +412,30 @@ public class ProjectorScreen extends Screen {
 
         // Section labels
         ctx.drawTextWithShadow(this.textRenderer,
-            Text.literal("SOURCE"),
+            Text.translatable("gui.lumiereplay.projector.section_source"),
             x + PAD, y + ySrcLabel, COL_SECTION);
         ctx.drawTextWithShadow(this.textRenderer,
-            Text.literal("PLAYBACK"),
+            Text.translatable("gui.lumiereplay.projector.section_playback"),
             x + PAD, y + yPbLabel, COL_SECTION);
 
         int halfW = (iw - 20) / 2;
         ctx.drawTextWithShadow(this.textRenderer,
-            Text.literal("DISPLAY"),
+            Text.translatable("gui.lumiereplay.projector.section_screen"),
             x + PAD, y + yDqLabel, COL_SECTION);
-        ctx.drawTextWithShadow(this.textRenderer,
-            Text.literal("QUALITY"),
-            x + PAD + halfW + 20, y + yDqLabel, COL_SECTION);
+        Text qLabel = Text.translatable("gui.lumiereplay.projector.section_quality");
+        ctx.drawTextWithShadow(this.textRenderer, qLabel, x + PAD + halfW + 20, y + yDqLabel, COL_SECTION);
+
+        // What the source really delivers, next to the requested cap. A platform
+        // stream fed through a pipe can only be a single muxed file, so the cap is
+        // frequently not reached; showing the delivered size keeps the row honest.
+        int[] src = VideoManager.getSourceResolution(pos);
+        if (src != null) {
+            int cap = requestedHeight();
+            int srcCol = (cap > 0 && src[1] * 4 < cap * 3) ? 0xFFFFAA44 : COL_SECONDARY;
+            ctx.drawTextWithShadow(this.textRenderer,
+                Text.translatable("gui.lumiereplay.projector.source", src[0] + "×" + src[1]),
+                x + PAD + halfW + 28 + textRenderer.getWidth(qLabel), y + yDqLabel, srcCol);
+        }
 
         // History counter
         String histLabel;
@@ -414,6 +490,14 @@ public class ProjectorScreen extends Screen {
         }
     }
 
+    /** Redstone state comes from the block entity, which the server keeps updated. */
+    private boolean isRedstonePowered() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.world == null) return false;
+        return mc.world.getBlockEntity(pos) instanceof ProjectorBlockEntity projector
+            && projector.isRedstonePowered();
+    }
+
     private static int getStatusColor(PlayerState state) {
         return switch (state) {
             case PLAYING   -> 0xFF44FF88;
@@ -439,12 +523,16 @@ public class ProjectorScreen extends Screen {
     private void applyAndPlay() {
         String url = urlField.getText().trim();
         if (url.isEmpty()) return;
+        boolean newSource = !url.equals(currentUrl);
         currentUrl = url;
         isPlaying  = true;
         playPauseBtn.setMessage(Text.translatable("gui.lumiereplay.projector.pause"));
         LumiereConfig.addHistoryUrl(url);
         historyUrls = LumiereConfig.getHistoryUrls();
         historyIndex = -1;
+        // A different source is a new timeline: drop any remembered position,
+        // otherwise the panel would try to resume the old media's timestamp.
+        if (newSource) SyncClock.reset(pos);
         VideoManager.update(pos, url, true, volume, selectedQuality);
         sendStateOnly();
     }
@@ -463,9 +551,40 @@ public class ProjectorScreen extends Screen {
         urlField.setText(url);
     }
 
+    /** Submits the current panel state without moving the shared timeline. */
     private void sendStateOnly() {
-        ClientPlayNetworking.send(new ProjectorUpdatePayload(
-            pos, currentUrl, isPlaying, volume, screenWidth, screenHeight, accessMode));
+        ProjectorClientNet.send(pos, currentUrl, isPlaying, volume,
+            screenWidth, screenHeight, accessMode, selectedQuality.key);
+    }
+
+    /**
+     * Submits state and asks every viewer to move to the given media position.
+     * The local player is seeked first so the panel does not snap back while the
+     * command round trips.
+     */
+    /**
+     * Seeks locally and publishes the new position as the shared timeline.
+     * Media that reports no duration (live streams and sources fed through a
+     * pipe) is refused here: a seek request on such a source lands wherever the
+     * buffer happens to be, which looks like a random jump rather than a seek.
+     */
+    private void seekToAndShare(long targetMs) {
+        long len = VideoManager.getLengthMs(pos);
+        if (len <= 0) {
+            showSeekError("gui.lumiereplay.message.seek_no_timeline");
+            return;
+        }
+        long clamped = Math.max(0L, Math.min(len, targetMs));
+        if (!VideoManager.seekTo(pos, clamped)) {
+            showSeekError("gui.lumiereplay.message.seek_unsupported");
+            return;
+        }
+        SyncClock.reanchor(pos, clamped);
+    }
+
+    /** Current local playback position, or -1 when the media does not report one. */
+    private long localPositionMs() {
+        return VideoManager.getPositionMs(pos);
     }
 
     private void playClick() {
@@ -484,34 +603,43 @@ public class ProjectorScreen extends Screen {
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_LEFT) {
-            long cur = VideoManager.getPositionMs(pos);
+            long cur = localPositionMs();
             if (cur < 0) {
-                showSeekError("Position unknown");
+                showSeekError("gui.lumiereplay.message.position_unknown");
                 return true;
             }
-            boolean ok = VideoManager.seekTo(pos, Math.max(0, cur - 5000));
-            if (!ok) showSeekError("Seek not supported");
+            seekToAndShare(cur - SEEK_STEP_MS);
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_RIGHT) {
-            long cur = VideoManager.getPositionMs(pos);
-            long len = VideoManager.getLengthMs(pos);
-            if (cur < 0 || len <= 0) {
-                showSeekError(len <= 0 ? "Live stream" : "Position unknown");
+            long cur = localPositionMs();
+            if (cur < 0) {
+                showSeekError("gui.lumiereplay.message.position_unknown");
                 return true;
             }
-            boolean ok = VideoManager.seekTo(pos, Math.min(len, cur + 5000));
-            if (!ok) showSeekError("Seek not supported");
+            seekToAndShare(cur + SEEK_STEP_MS);
             return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
-    private void showSeekError(String msg) {
+    /** Short advice line in the action bar, translated like the rest of the panel. */
+    /** Height the selected quality caps the source at, 0 when unconstrained. */
+    private int requestedHeight() {
+        return switch (selectedQuality) {
+            case P1080 -> 1080;
+            case P720  -> 720;
+            case P480  -> 480;
+            case P360  -> 360;
+            default    -> 0;
+        };
+    }
+
+    private void showSeekError(String translationKey) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player != null) {
             mc.player.sendMessage(
-                net.minecraft.text.Text.literal(msg).formatted(net.minecraft.util.Formatting.YELLOW), true);
+                Text.translatable(translationKey).formatted(Formatting.YELLOW), true);
         }
     }
 
@@ -535,12 +663,12 @@ public class ProjectorScreen extends Screen {
 
             if (lenMs <= 0) {
                 seekable = false;
-                String liveLabel = Text.translatable("gui.lumiereplay.projector.live").getString();
+                Text liveLabel = Text.translatable("gui.lumiereplay.projector.live");
                 if (isLoading || (buf > 0 && buf < 100)) {
-                    String bufLabel = buf > 0 ? "Buffering " + buf + "%" : "Buffering...";
-                    setMessage(Text.literal(liveLabel + "  •  " + bufLabel));
+                    setMessage(Text.literal(liveLabel.getString() + "  •  ")
+                        .append(bufferingText(buf)));
                 } else {
-                    setMessage(Text.literal(liveLabel));
+                    setMessage(liveLabel);
                 }
                 return;
             }
@@ -549,8 +677,7 @@ public class ProjectorScreen extends Screen {
 
             String timeLabel = formatTime(posMs) + " / " + formatTime(lenMs);
             if (isLoading || (buf > 0 && buf < 100)) {
-                String bufLabel = buf > 0 ? "Buffering " + buf + "%" : "Buffering...";
-                setMessage(Text.literal(timeLabel + "     " + bufLabel));
+                setMessage(Text.literal(timeLabel + "     ").append(bufferingText(buf)));
             } else {
                 setMessage(Text.literal(timeLabel));
             }
@@ -558,7 +685,7 @@ public class ProjectorScreen extends Screen {
         @Override protected void applyValue() {
             if (!seekable) return;
             long lenMs = VideoManager.getLengthMs(ProjectorScreen.this.pos);
-            if (lenMs > 0) VideoManager.seekTo(ProjectorScreen.this.pos, (long)(value * lenMs));
+            if (lenMs > 0) ProjectorScreen.this.seekToAndShare((long)(value * lenMs));
         }
     }
 
@@ -569,7 +696,8 @@ public class ProjectorScreen extends Screen {
             updateMessage();
         }
         @Override protected void updateMessage() {
-            setMessage(Text.literal("🔊  " + ProjectorScreen.this.volume + "%"));
+            setMessage(Text.literal("🔊  ").append(
+                Text.translatable("gui.lumiereplay.projector.volume", ProjectorScreen.this.volume)));
         }
         @Override protected void applyValue() {
             ProjectorScreen.this.volume = (int)(value * 100);
@@ -579,6 +707,13 @@ public class ProjectorScreen extends Screen {
     }
 
     // === Helpers ===
+
+    /** "Buffering 43%" or "Buffering..." depending on what VLC reported. */
+    private static Text bufferingText(int percent) {
+        return percent > 0
+            ? Text.translatable("gui.lumiereplay.projector.buffering", percent + "%")
+            : Text.translatable("gui.lumiereplay.projector.buffering_short");
+    }
 
     private static String formatTime(long ms) {
         if (ms < 0) ms = 0;

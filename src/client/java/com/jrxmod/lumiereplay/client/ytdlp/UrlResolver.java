@@ -1,8 +1,7 @@
 package com.jrxmod.lumiereplay.client.ytdlp;
 
 import com.jrxmod.lumiereplay.LumierePlay;
-import com.jrxmod.lumiereplay.client.ytdlp.YtDlpManager;
-import com.jrxmod.lumiereplay.client.ytdlp.PipeProxy;
+import com.jrxmod.lumiereplay.client.LumiereConfig;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -38,6 +37,21 @@ public class UrlResolver {
         public final String key;
         public final String label;
         Quality(String key, String label) { this.key = key; this.label = label; }
+
+        /**
+         * Maps the quality key travelling in projector packets back to an entry.
+         * Unknown or absent keys resolve to the default the GUI opens with, so a
+         * server storing a key from a newer or older client never breaks playback.
+         */
+        public static Quality fromKey(String key) {
+            if (key != null) {
+                for (Quality q : values()) if (q.key.equals(key)) return q;
+            }
+            return P720;
+        }
+
+        /** Key form used on the wire and in the block entity. */
+        public String key() { return key; }
     }
 
     private static final boolean IS_WINDOWS =
@@ -102,6 +116,19 @@ public class UrlResolver {
     }
 
     public static void resolveAsync(String url, Quality quality, Consumer<String> onResolved) {
+        resolveAsync(url, quality, 0L, onResolved);
+    }
+
+    /**
+     * Resolves a source, optionally asking for playback to begin at startMs.
+     *
+     * The offset is only meaningful for the piped path, where yt-dlp is told to
+     * skip ahead with --download-sections. A resolved stream URL cannot be
+     * offset here: seeking is done through VLC once the media is open, so the
+     * direct path ignores startMs and the caller seeks after the first frame.
+     */
+    public static void resolveAsync(String url, Quality quality, long startMs,
+                                    Consumer<String> onResolved) {
         if (!YtDlpManager.isReady()) {
             LumierePlay.LOGGER.warn("yt-dlp not ready, cannot resolve: {}", url);
             onResolved.accept(null);
@@ -110,7 +137,7 @@ public class UrlResolver {
 
         CompletableFuture.runAsync(() -> {
             if (needsProxy(url)) {
-                resolveViaProxy(url, quality, onResolved);
+                resolveViaProxy(url, quality, startMs, onResolved);
             } else {
                 resolveViaDirect(url, quality, onResolved);
             }
@@ -123,7 +150,7 @@ public class UrlResolver {
      * Builds the yt-dlp pipe command and starts a StreamProxy.
      * Returns the proxy's localhost URL to the caller.
      */
-    private static void resolveViaProxy(String url, Quality quality,
+    private static void resolveViaProxy(String url, Quality quality, long startMs,
                                         Consumer<String> onResolved) {
         String browser = detectBrowser();
 
@@ -135,6 +162,20 @@ public class UrlResolver {
         cmd.add("-f");
         cmd.add(buildProxyFormatArg(url, quality));
         cmd.add("--hls-use-mpegts");
+
+        // Skipping ahead is done by the extractor so the pipe only ever carries
+        // media from the requested position on. Open ended ranges use "inf" as the
+        // end marker. This path depends on yt-dlp being able to cut while piping
+        // and is therefore opt in; a failure is reported as a null resolution and
+        // the caller retries without an offset.
+        if (startMs > 0) {
+            cmd.add("--download-sections");
+            cmd.add("*" + (startMs / 1000L) + "-inf");
+        }
+
+        String ytdlpProxy = configuredProxy();
+        if (ytdlpProxy != null) cmd.add("--proxy=" + ytdlpProxy);
+
         cmd.add("-o");
         cmd.add("-");
 
@@ -143,6 +184,7 @@ public class UrlResolver {
             cmd.add(browser);
         }
 
+        appendConfiguredArgs(cmd);
         cmd.add(url);
 
         PipeProxy proxy = PipeProxy.start(cmd);
@@ -175,6 +217,35 @@ public class UrlResolver {
             }
         }
         onResolved.accept(resolved);
+    }
+
+    /**
+     * Proxy from config/lumiereplay.json, or null when unset. Surrounding
+     * whitespace and bare host values are tolerated because hand edited configs
+     * often carry neither a scheme nor a consistent quoting.
+     */
+    /**
+     * Appends the operator supplied yt-dlp arguments from the config file, skipping
+     * empty entries and never more than a sane handful. Applied last before the URL,
+     * so a repeated option here overrides the one the mod passed.
+     */
+    private static void appendConfiguredArgs(List<String> cmd) {
+        String[] extra = LumiereConfig.get().network.ytdlp_args;
+        if (extra == null) return;
+        int added = 0;
+        for (String arg : extra) {
+            if (arg == null || added >= 16) continue;
+            if (arg.isBlank()) continue;
+            cmd.add(arg);
+            added++;
+        }
+    }
+
+    private static String configuredProxy() {
+        String proxy = LumiereConfig.get().network.proxy;
+        if (proxy == null) return null;
+        proxy = proxy.trim();
+        return proxy.isEmpty() ? null : proxy;
     }
 
     /**
@@ -212,6 +283,9 @@ public class UrlResolver {
             cmd.add(buildFormatArg(url, quality));
             cmd.add("--get-url");
 
+            String proxy = configuredProxy();
+            if (proxy != null) cmd.add("--proxy=" + proxy);
+
             if (browser != null) {
                 cmd.add("--cookies-from-browser");
                 cmd.add(browser);
@@ -221,6 +295,7 @@ public class UrlResolver {
                 cmd.add("--no-check-certificates");
             }
 
+            appendConfiguredArgs(cmd);
             cmd.add(url);
 
             ProcessBuilder pb = new ProcessBuilder(cmd);

@@ -1,7 +1,7 @@
 package com.jrxmod.lumiereplay.client.ytdlp;
 
 import com.jrxmod.lumiereplay.LumierePlay;
-import com.jrxmod.lumiereplay.client.ytdlp.FfmpegManager;
+import com.jrxmod.lumiereplay.client.LumiereConfig;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -132,6 +132,7 @@ public class PipeProxy {
                 // Start yt-dlp
                 ProcessBuilder ytPb = new ProcessBuilder(ytdlpCmd);
                 ytPb.redirectErrorStream(false);
+                applyProxy(ytPb);
                 Process ytProc = ytPb.start();
                 ytdlpProc = ytProc;
 
@@ -151,6 +152,7 @@ public class PipeProxy {
 
                 ProcessBuilder ffPb = new ProcessBuilder(ffCmd);
                 ffPb.redirectErrorStream(false);
+                applyProxy(ffPb);
                 Process ff = ffPb.start();
                 ffmpegProc = ff;
 
@@ -232,6 +234,7 @@ public class PipeProxy {
 
                 ProcessBuilder pb = new ProcessBuilder(cmd);
                 pb.redirectErrorStream(false);
+                applyProxy(pb);
                 Process proc = pb.start();
                 ytdlpProc = proc;
 
@@ -246,6 +249,27 @@ public class PipeProxy {
         }, "lumiereplay-pipe-download");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Points yt-dlp and ffmpeg at the proxy from config/lumiereplay.json.
+     * Both tools read these variables from the environment, so the setting also
+     * covers requests the tools make on their own. Without a configured proxy the
+     * inherited environment is left untouched.
+     */
+    private static void applyProxy(ProcessBuilder pb) {
+        String proxy = LumiereConfig.get().network.proxy;
+        if (proxy == null) return;
+        proxy = proxy.trim();
+        if (proxy.isEmpty()) return;
+
+        Map<String, String> env = pb.environment();
+        env.put("HTTP_PROXY", proxy);
+        env.put("http_proxy", proxy);
+        env.put("HTTPS_PROXY", proxy);
+        env.put("https_proxy", proxy);
+        env.put("ALL_PROXY", proxy);
+        env.put("all_proxy", proxy);
     }
 
     private static void drainStderr(InputStream err, String threadName) {

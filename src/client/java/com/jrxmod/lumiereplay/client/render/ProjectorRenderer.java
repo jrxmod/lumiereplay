@@ -24,6 +24,8 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.RotationAxis;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.LightType;
+import net.minecraft.world.World;
 import org.joml.Matrix4f;
 
 import java.util.HashMap;
@@ -68,7 +70,7 @@ public class ProjectorRenderer {
 
         Vec3d cam = ctx.camera().getPos();
         Frustum frustum = ctx.frustum();
-        double pauseDistSq = LumiereConfig.get().lazy.pause_distance_sq;
+        double pauseDistSq = LumiereConfig.get().lazy.pauseDistSq();
 
         Set<BlockPos> knownSnapshot;
         synchronized (textures) { knownSnapshot = new HashSet<>(knownPos); }
@@ -99,7 +101,8 @@ public class ProjectorRenderer {
             if (frustum != null && !frustum.isVisible(new Box(pos).expand(0.5))) continue;
 
             Direction facing = state.get(ProjectorBlock.FACING);
-            drawProjector(matrices, cam, pos, projector, tex, facing);
+            drawProjector(matrices, cam, pos, projector, tex, facing,
+                ambientDarkness(client.world, pos, facing));
         }
 
         for (BlockPos pos : toRemove) untrackProjector(pos);
@@ -107,7 +110,7 @@ public class ProjectorRenderer {
 
     private static void drawProjector(MatrixStack matrices, Vec3d cam,
                                       BlockPos pos, ProjectorBlockEntity projector,
-                                      ScreenTexture tex, Direction facing) {
+                                      ScreenTexture tex, Direction facing, float darkness) {
         float w = projector.getScreenWidth();
         float h = projector.getScreenHeight();
         float bezel = LumiereConfig.get().screen.bezel_size;
@@ -128,10 +131,114 @@ public class ProjectorRenderer {
         matrices.translate(cx, cy, cz);
         matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(yaw));
 
+        // A paused or broken screen must not keep a halo behind: only running media
+        // lights the room, on the block and around the frame alike.
+        if (projector.isPlaying()) drawGlow(matrices, w, h, bezel, tex, darkness);
         drawBezel(matrices, w, h, bezel);
         drawScreenQuad(matrices, w, h, tex);
 
         matrices.pop();
+    }
+
+    /**
+     * Coloured spill of light around the frame, tinted by the average of the picture
+     * and faded out towards the outside so that it has no hard edge. It is drawn
+     * first and slightly behind the bezel, so the two later quads paint over its
+     * middle and only the spill outside the frame stays visible.
+     */
+    private static void drawGlow(MatrixStack matrices, float w, float h,
+                                 float bezel, ScreenTexture tex, float darkness) {
+        if (darkness <= 0.02f) return;
+
+        int luma = tex.getAvgLuma();
+        if (luma < 16) return;
+
+        int color = tex.getAvgColor();
+        int r = (color >> 16) & 0xFF;
+        int g = (color >>  8) & 0xFF;
+        int b =  color         & 0xFF;
+
+        int peak = (int) ((40 + luma * 70 / 255) * darkness);
+        if (peak < 10) return;
+
+        float spill = bezel + 0.40f + 0.85f * darkness;
+
+        Matrix4f mat = matrices.peek().getPositionMatrix();
+        RenderSystem.setShader(GameRenderer::getPositionColorProgram);
+        RenderSystem.enableBlend(); RenderSystem.defaultBlendFunc();
+        RenderSystem.enableCull();
+        RenderSystem.depthMask(false);
+
+        // One plane just in front of the block, behind the bezel and the screen, so
+        // both later quads hide the middle of the glow and only the spill survives.
+        float z   = 0.5001f;
+        float xIn = w / 2f;                    // screen edge
+        float xOu = w / 2f + bezel + spill;    // outer edge of the spill
+        float yIn = -bezel;                    // bottom edge of the frame
+        float yLo = -bezel - spill;            // below the frame
+        float yHi = h + bezel + spill;         // above the frame
+
+        Tessellator tess = Tessellator.getInstance();
+        BufferBuilder buf = tess.begin(VertexFormat.DrawMode.QUADS, VertexFormats.POSITION_COLOR);
+        emitSpillY(buf, mat, z, -xOu, xOu, yLo, yIn, false, r, g, b, peak);
+        emitSpillY(buf, mat, z, -xOu, xOu, yIn, yHi, true,  r, g, b, peak);
+        emitSpillX(buf, mat, z, -xOu, -xIn, yLo, yHi, r, g, b, peak);
+        emitSpillX(buf, mat, z,  xOu,  xIn, yLo, yHi, r, g, b, peak);
+        BufferRenderer.drawWithGlobalProgram(buf.end());
+
+        RenderSystem.depthMask(true);
+        RenderSystem.disableBlend();
+    }
+
+    /**
+     * A horizontal band of spill between two y levels, full alpha on the edge that
+     * touches the frame and none on the outer one. Vertices are written counter
+     * clockwise (bottom left, bottom right, top right, top left) so the front face
+     * of the quad is the one that survives culling.
+     */
+    private static void emitSpillY(BufferBuilder buf, Matrix4f mat, float z,
+                                   float x0, float x1, float yLow, float yHigh,
+                                   boolean innerIsLow, int r, int g, int b, int a) {
+        int aLow  = innerIsLow ? a : 0;
+        int aHigh = innerIsLow ? 0 : a;
+        buf.vertex(mat, x0, yLow, z).color(r, g, b, aLow);
+        buf.vertex(mat, x1, yLow, z).color(r, g, b, aLow);
+        buf.vertex(mat, x1, yHigh, z).color(r, g, b, aHigh);
+        buf.vertex(mat, x0, yHigh, z).color(r, g, b, aHigh);
+    }
+
+    /**
+     * A vertical band of spill between two x levels, the edge nearer to the screen
+     * centre carrying the alpha. Winding stays counter clockwise for both sides.
+     */
+    private static void emitSpillX(BufferBuilder buf, Matrix4f mat, float z,
+                                   float xOuter, float xInner, float yLow, float yHigh,
+                                   int r, int g, int b, int a) {
+        if (xOuter < xInner) {
+            buf.vertex(mat, xOuter, yLow, z).color(r, g, b, 0);
+            buf.vertex(mat, xInner, yLow, z).color(r, g, b, a);
+            buf.vertex(mat, xInner, yHigh, z).color(r, g, b, a);
+            buf.vertex(mat, xOuter, yHigh, z).color(r, g, b, 0);
+        } else {
+            buf.vertex(mat, xInner, yLow, z).color(r, g, b, a);
+            buf.vertex(mat, xOuter, yLow, z).color(r, g, b, 0);
+            buf.vertex(mat, xOuter, yHigh, z).color(r, g, b, 0);
+            buf.vertex(mat, xInner, yHigh, z).color(r, g, b, a);
+        }
+    }
+
+    /**
+     * How dark the spot the screen shines into is, from nothing in open daylight to
+     * one at night or under a roof. The light the projector itself adds to the world
+     * is deliberately not counted here: it would silence the glow exactly where it is
+     * supposed to be seen.
+     */
+    private static float ambientDarkness(World world, BlockPos pos, Direction facing) {
+        if (world == null) return 1f;
+        int sky = world.getLightLevel(LightType.SKY, pos.up().offset(facing));
+        int effective = Math.max(0, sky - world.getAmbientDarkness());
+        float dark = 1f - effective / 15f;
+        return dark < 0f ? 0f : (dark > 1f ? 1f : dark);
     }
 
     private static void drawBezel(MatrixStack matrices, float w, float h, float bezel) {

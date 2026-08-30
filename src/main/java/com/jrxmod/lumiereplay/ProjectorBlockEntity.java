@@ -22,6 +22,15 @@ public class ProjectorBlockEntity extends BlockEntity {
     public static final String NBT_OWNER   = "OwnerUuid";
     public static final String NBT_ACCESS   = "AccessMode";
     public static final String NBT_REDSTONE = "RedstonePowered";
+    public static final String NBT_QUALITY    = "QualityKey";
+    public static final String NBT_POSITION   = "PositionMs";
+
+    /**
+     * How far the nominal timeline may run ahead of the last anchor. The clock
+     * service folds the elapsed part back in on every push, so this only bounds a
+     * single interval, for example the moment between a resume and the first tick.
+     */
+    public static final int CLOCK_MAX_AHEAD_TICKS = 6000;
 
     private String     videoUrl     = "";
     private boolean    isPlaying    = false;
@@ -31,6 +40,12 @@ public class ProjectorBlockEntity extends BlockEntity {
     private String     ownerUuid       = "";
     private AccessMode accessMode      = AccessMode.ALL;
     private boolean    redstonePowered = false;
+    private String     qualityKey   = LumierePlay.DEFAULT_QUALITY_KEY;
+
+    /** Media position in milliseconds at anchorTick. Advances only while playing. */
+    private long positionMs = 0L;
+    /** World time the stored position was measured at, server ticks. */
+    private long anchorTick = 0L;
 
     public ProjectorBlockEntity(BlockPos pos, BlockState state) {
         super(ModBlockEntities.PROJECTOR, pos, state);
@@ -47,6 +62,11 @@ public class ProjectorBlockEntity extends BlockEntity {
         nbt.putString(NBT_OWNER,   ownerUuid);
         nbt.putString(NBT_ACCESS,  accessMode.id);
         nbt.putBoolean(NBT_REDSTONE, redstonePowered);
+        nbt.putString(NBT_QUALITY, qualityKey);
+        // The timeline is stored frozen at its nominal value. The anchor itself is
+        // memory only, so a reload cannot invent playback time for the interval
+        // during which the chunk was unloaded.
+        nbt.putLong(NBT_POSITION, nominalPositionMs());
     }
 
     @Override
@@ -71,6 +91,17 @@ public class ProjectorBlockEntity extends BlockEntity {
         ownerUuid       = nbt.contains(NBT_OWNER)    ? nbt.getString(NBT_OWNER)           : "";
         accessMode      = nbt.contains(NBT_ACCESS)   ? AccessMode.fromId(nbt.getString(NBT_ACCESS)) : AccessMode.ALL;
         redstonePowered = nbt.contains(NBT_REDSTONE) ? nbt.getBoolean(NBT_REDSTONE)        : false;
+
+        // Quality and clock fields were introduced in 0.7.0: absent keys mean
+        // "default quality, timeline starts from the beginning".
+        qualityKey = nbt.contains(NBT_QUALITY)
+            ? clampQualityKey(nbt.getString(NBT_QUALITY)) : LumierePlay.DEFAULT_QUALITY_KEY;
+        positionMs = nbt.contains(NBT_POSITION) ? Math.max(0L, nbt.getLong(NBT_POSITION)) : 0L;
+
+        // Re-anchor a restored timeline to the present so that the frozen
+        // position stays where it is instead of resuming the extrapolation that
+        // saved it. Anchor 0 means "not extrapolating" (see nominalPositionMs).
+        anchorTick = (isPlaying && world != null) ? world.getTime() : 0L;
     }
 
     // Returns true for http(s) URLs, absolute Unix paths, Windows paths (C:\, D:\),
@@ -86,6 +117,12 @@ public class ProjectorBlockEntity extends BlockEntity {
                               && s.charAt(1) == ':'
                               && (s.charAt(2) == '\\' || s.charAt(2) == '/'))
             || s.startsWith("\\\\");
+    }
+
+    /** Keeps a malformed or oversized quality key from reaching clients. */
+    private static String clampQualityKey(String key) {
+        if (key == null || key.isEmpty()) return LumierePlay.DEFAULT_QUALITY_KEY;
+        return key.length() <= 16 ? key : key.substring(0, 16);
     }
 
     /** Convert a local file path to a VLC-friendly URI. */
@@ -115,8 +152,48 @@ public class ProjectorBlockEntity extends BlockEntity {
 
     private void sync() {
         markDirty();
-        if (world != null && !world.isClient())
+        if (world != null && !world.isClient()) {
             world.updateListeners(pos, getCachedState(), getCachedState(), 3);
+            ProjectorClockService.arm(this);
+        }
+    }
+
+    /**
+     * Media position every viewer should be at right now. Frozen while paused,
+     * extrapolated from the anchor tick while playing, and never extrapolated by
+     * more than {@link #CLOCK_MAX_AHEAD_TICKS}.
+     */
+    public long nominalPositionMs() {
+        long base = Math.max(0L, positionMs);
+        if (!isPlaying || world == null || anchorTick <= 0L) return base;
+        long elapsed = world.getTime() - anchorTick;
+        if (elapsed <= 0) return base;
+        if (elapsed > CLOCK_MAX_AHEAD_TICKS) elapsed = CLOCK_MAX_AHEAD_TICKS;
+        return base + elapsed * 50L;
+    }
+
+    /**
+     * Folds the extrapolated part of the timeline into the stored position and
+     * restarts the anchor. Without this the elapsed term keeps growing from the
+     * last state change, hits the cap, and the timeline silently stops tracking
+     * the media on any video longer than the cap.
+     */
+    public void commitTimeline() {
+        if (!isPlaying || world == null) return;
+        long nominal = nominalPositionMs();
+        if (nominal == positionMs && anchorTick > 0L && world.getTime() - anchorTick <= 1L) return;
+        positionMs  = nominal;
+        anchorTick  = world.getTime();
+    }
+
+    /**
+     * Moves the shared timeline. The anchor is reset so the new position is the
+     * one viewers align to, not the old position plus elapsed time.
+     */
+    public void seekTo(long ms) {
+        positionMs  = Math.max(0L, ms);
+        anchorTick  = world != null ? world.getTime() : 0L;
+        sync();
     }
 
     public String  getVideoUrl()    { return videoUrl; }
@@ -127,6 +204,7 @@ public class ProjectorBlockEntity extends BlockEntity {
 
     public String     getOwnerUuid()  { return ownerUuid; }
     public AccessMode getAccessMode() { return accessMode; }
+    public String     getQualityKey() { return qualityKey; }
 
     public void setOwnerUuid(String uuid) {
         this.ownerUuid = uuid != null ? uuid : "";
@@ -141,8 +219,9 @@ public class ProjectorBlockEntity extends BlockEntity {
     public boolean isRedstonePowered() { return redstonePowered; }
 
     public void setRedstonePowered(boolean powered) {
+        if (this.redstonePowered == powered) return;
         this.redstonePowered = powered;
-        markDirty();
+        sync();
     }
 
     /**
@@ -159,12 +238,52 @@ public class ProjectorBlockEntity extends BlockEntity {
         };
     }
 
+    /** True for the player who placed the block, and for anybody when unowned. */
+    public boolean isOwner(PlayerEntity player) {
+        return ownerUuid.isEmpty() || ownerUuid.equals(player.getUuidAsString());
+    }
+
     public void setVideoUrl(String url) {
-        this.videoUrl = (url != null && isValidUrl(url)) ? url : "";
+        String clean = (url != null && isValidUrl(url)) ? url : "";
+        if (clean.equals(this.videoUrl)) return;
+        this.videoUrl = clean;
+        // A different source is a different timeline, so it always restarts from
+        // zero; otherwise viewers would be told to catch up to a position the
+        // fresh stream never had.
+        this.positionMs = 0L;
+        this.anchorTick = world != null ? world.getTime() : 0L;
         sync();
     }
 
-    public void setPlaying(boolean v)          { this.isPlaying = v; sync(); }
+    public void setPlaying(boolean v) {
+        if (v != this.isPlaying) {
+            if (this.isPlaying) {
+                // Pause: keep the timeline where it stands instead of advancing it.
+                this.positionMs = nominalPositionMs();
+            } else {
+                this.anchorTick = world != null ? world.getTime() : 0L;
+            }
+            this.isPlaying = v;
+            // A paused or idle screen must not keep the hall lit, so the level is
+            // rewritten on every actual change of the playback state.
+            ProjectorBlock.setLevel(world, pos, v ? ProjectorBlock.LEVEL_PLAYING : 0);
+        }
+        sync();
+    }
+
     public void setVolume(int v)               { this.volume = Math.max(0, Math.min(100, v)); sync(); }
-    public void setScreenSize(int w, int h)    { this.screenWidth = w; this.screenHeight = h; sync(); }
+
+    /** Size is clamped to the same 1..64 block range the save format accepts. */
+    public void setScreenSize(int w, int h) {
+        this.screenWidth  = Math.max(1, Math.min(64, w));
+        this.screenHeight = Math.max(1, Math.min(64, h));
+        sync();
+    }
+
+    public void setQualityKey(String key) {
+        String clean = clampQualityKey(key);
+        if (clean.equals(this.qualityKey)) return;
+        this.qualityKey = clean;
+        sync();
+    }
 }

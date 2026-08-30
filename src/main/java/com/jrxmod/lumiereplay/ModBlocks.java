@@ -13,7 +13,12 @@ public final class ModBlocks {
     // Projector block - renders a virtual screen and stores playback state
     public static final ProjectorBlock PROJECTOR = register(
         "projector",
-        new ProjectorBlock(AbstractBlock.Settings.create().strength(3.5f, 4.0f).requiresTool())
+        new ProjectorBlock(AbstractBlock.Settings.create()
+            .strength(3.5f, 4.0f)
+            .requiresTool()
+            // The light of the screen is part of the block state, so vanilla
+            // chunk lighting, saving and syncing handle it without any hook.
+            .luminance(state -> state.get(ProjectorBlock.LEVEL)))
     );
 
     /**

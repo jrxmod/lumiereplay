@@ -56,6 +56,15 @@ public class ScreenTexture implements AutoCloseable {
     private volatile int                   uploadThrottle = 1;
     private          int                   uploadTick     = 0;
 
+    /** Average colour of the displayed picture as 0xFFRRGGBB, used to tint the glow. */
+    private volatile int avgColor         = 0;
+    private          int framesSinceSample = 0;
+
+    /** Stride through the pixel buffer when sampling: prime, so it never follows rows. */
+    private static final int SAMPLE_STRIDE = 41;
+    /** Decoded frames between two samples; keeps the media thread free. */
+    private static final int SAMPLE_EVERY  = 6;
+
     public ScreenTexture() {
         this.textureId = Identifier.of(LumierePlay.MOD_ID, "screen_" + (idCounter++));
         allocate();
@@ -88,6 +97,7 @@ public class ScreenTexture implements AutoCloseable {
     }
 
     public void fillBlack() {
+        avgColor = 0;
         if (closed || image == null) return;
         if (nativePointer != 0L) {
             for (int i = 0; i < PIXEL_COUNT; i++)
@@ -105,6 +115,7 @@ public class ScreenTexture implements AutoCloseable {
      * Text is centered and large enough to be readable from several blocks away.
      */
     public void fillStatus(PlayerState state) {
+        avgColor = 0;
         if (closed || image == null) return;
         if (state == PlayerState.IDLE || state == PlayerState.PLAYING || state == PlayerState.PAUSED) {
             fillBlack();
@@ -216,6 +227,46 @@ public class ScreenTexture implements AutoCloseable {
                     image.setColor(x, y, toAbgr(argb));
                 }
         }
+
+        sampleAverage();
+    }
+
+    /**
+     * Averages a strided sample of the pixel buffer and folds it into an exponential
+     * mean, so a cut in the film moves the tint over a few frames instead of
+     * flashing. Runs on the media thread right after a frame was written.
+     */
+    private void sampleAverage() {
+        if (closed || nativePointer == 0L) return;
+        if (++framesSinceSample < SAMPLE_EVERY) return;
+        framesSinceSample = 0;
+
+        long r = 0, g = 0, b = 0, n = 0;
+        for (int i = 0; i < PIXEL_COUNT; i += SAMPLE_STRIDE) {
+            int abgr = MemoryUtil.memGetInt(nativePointer + (long) i * 4);
+            r +=  abgr        & 0xFF;
+            g += (abgr >>  8) & 0xFF;
+            b += (abgr >> 16) & 0xFF;
+            n++;
+        }
+        if (n == 0) return;
+
+        int prev = avgColor;
+        int nr = (int) (r / n),        ng = (int) (g / n),        nb = (int) (b / n);
+        int pr = (prev >> 16) & 0xFF, pg = (prev >> 8) & 0xFF,  pb = prev & 0xFF;
+        avgColor = 0xFF000000
+                 | (((pr * 3 + nr) >> 2) << 16)
+                 | (((pg * 3 + ng) >> 2) << 8)
+                 |   ((pb * 3 + nb) >> 2);
+    }
+
+    /** Average colour of the current picture as 0xFFRRGGBB, zero when nothing plays. */
+    public int getAvgColor() { return avgColor; }
+
+    /** Perceived brightness of that average, 0..255. */
+    public int getAvgLuma() {
+        int c = avgColor;
+        return (((c >> 16) & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + (c & 0xFF) * 114) / 1000;
     }
 
     // ARGB int -> ABGR int (swap R and B)
@@ -262,6 +313,7 @@ public class ScreenTexture implements AutoCloseable {
     public void close() {
         closed        = true;
         nativePointer = 0L;
+        avgColor      = 0;
         unregister();
         if (texture != null) { texture.close(); texture = null; }
         if (image != null) { image.close(); image = null; }

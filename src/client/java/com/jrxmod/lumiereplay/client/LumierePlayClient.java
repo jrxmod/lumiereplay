@@ -6,11 +6,15 @@ import com.jrxmod.lumiereplay.ProjectorBlockEntity;
 import com.jrxmod.lumiereplay.client.render.ProjectorRenderer;
 import com.jrxmod.lumiereplay.client.screen.ProjectorScreen;
 import com.jrxmod.lumiereplay.client.sound.ProjectorSound;
+import com.jrxmod.lumiereplay.client.video.SyncClock;
 import com.jrxmod.lumiereplay.client.video.VideoManager;
 import com.jrxmod.lumiereplay.client.ytdlp.FfmpegManager;
 import com.jrxmod.lumiereplay.client.ytdlp.YtDlpManager;
+import com.jrxmod.lumiereplay.network.ProjectorClockPayload;
 import com.jrxmod.lumiereplay.network.ProjectorSyncPayload;
+import com.jrxmod.lumiereplay.network.ProjectorSyncV2Payload;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
@@ -32,44 +36,70 @@ public class LumierePlayClient implements ClientModInitializer {
         YtDlpManager.initialize();
         FfmpegManager.initialize();
         ProjectorRenderer.register();
-        registerSyncReceiver();
+        registerSyncReceivers();
         registerBlockUseCallback();
         registerJoinHandler();
+        registerSyncTick();
         registerDisconnectCleanup();
     }
 
-    private void registerSyncReceiver() {
-        ClientPlayNetworking.registerGlobalReceiver(ProjectorSyncPayload.ID, (payload, context) -> {
-            context.client().execute(() -> {
-                BlockPos pos = payload.pos();
-                if (context.client().world == null) return;
+    /**
+     * Receives projector state from the server. Both wire formats are handled: v2
+     * additionally carries the quality choice and the shared media position,
+     * while the legacy packet leaves both untouched locally.
+     */
+    private void registerSyncReceivers() {
+        ClientPlayNetworking.registerGlobalReceiver(ProjectorSyncV2Payload.ID, (payload, context) ->
+            context.client().execute(() -> applyState(
+                payload.pos(), payload.videoUrl(), payload.isPlaying(), payload.volume(),
+                payload.screenWidth(), payload.screenHeight(), payload.accessMode(),
+                payload.qualityKey(), payload.positionMs())));
 
-                BlockEntity be = context.client().world.getBlockEntity(pos);
-                if (!(be instanceof ProjectorBlockEntity projector)) return;
+        ClientPlayNetworking.registerGlobalReceiver(ProjectorSyncPayload.ID, (payload, context) ->
+            context.client().execute(() -> applyState(
+                payload.pos(), payload.videoUrl(), payload.isPlaying(), payload.volume(),
+                payload.screenWidth(), payload.screenHeight(), payload.accessMode(),
+                null, -1L)));
 
-                projector.setVideoUrl(payload.videoUrl());
-                projector.setPlaying(payload.isPlaying());
-                projector.setVolume(payload.volume());
-                projector.setScreenSize(payload.screenWidth(), payload.screenHeight());
-                projector.setAccessMode(payload.accessMode());
+        ClientPlayNetworking.registerGlobalReceiver(ProjectorClockPayload.ID, (payload, context) ->
+            context.client().execute(() ->
+                SyncClock.acceptClock(payload.pos(), payload.positionMs(), payload.isPlaying())));
+    }
 
-                ProjectorRenderer.trackProjector(pos);
-                ProjectorSound.setBaseVolume(pos, payload.volume());
+    private void applyState(BlockPos pos, String url, boolean playing, int volume,
+                            int width, int height, AccessMode accessMode,
+                            String qualityKey, long positionMs) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) return;
 
-                String  url     = payload.videoUrl();
-                boolean playing = payload.isPlaying();
+        BlockEntity be = client.world.getBlockEntity(pos);
+        if (!(be instanceof ProjectorBlockEntity projector)) return;
 
-                if (url.isEmpty()) {
-                    VideoManager.update(pos, url, false, payload.volume());
-                } else if (!playing) {
-                    VideoManager.pause(pos);
-                } else {
-                    VideoManager.update(pos, url, true, payload.volume());
-                }
+        projector.setVideoUrl(url);
+        projector.setPlaying(playing);
+        projector.setVolume(volume);
+        projector.setScreenSize(width, height);
+        projector.setAccessMode(accessMode);
+        if (qualityKey != null) projector.setQualityKey(qualityKey);
 
-                LumierePlay.LOGGER.debug("Projector synced at {} playing={}", pos, playing);
-            });
-        });
+        ProjectorRenderer.trackProjector(pos);
+        ProjectorSound.setBaseVolume(pos, volume);
+
+        // The timeline is stored before the pipeline is touched, so a viewer that
+        // starts playback here can be opened at the shared position directly.
+        if (positionMs >= 0) SyncClock.acceptState(pos, positionMs, playing);
+
+        if (url.isEmpty()) {
+            VideoManager.update(pos, url, false, volume);
+        } else if (!playing) {
+            VideoManager.pause(pos);
+        } else if (qualityKey != null) {
+            VideoManager.update(pos, url, true, volume, qualityKey);
+        } else {
+            VideoManager.update(pos, url, true, volume);
+        }
+
+        LumierePlay.LOGGER.debug("Projector synced at {} playing={}", pos, playing);
     }
 
     private void registerBlockUseCallback() {
@@ -102,7 +132,8 @@ public class LumierePlayClient implements ClientModInitializer {
                 projector.getScreenWidth(),
                 projector.getScreenHeight(),
                 projector.getAccessMode(),
-                projector.getOwnerUuid()
+                projector.getOwnerUuid(),
+                projector.getQualityKey()
             ));
 
             return ActionResult.SUCCESS;
@@ -144,6 +175,14 @@ public class LumierePlayClient implements ClientModInitializer {
                 }
             });
         });
+    }
+
+    /**
+     * Applies queued timeline alignment and checks for drift. Runs on the client
+     * thread and does nothing unless a shared timeline is known for a projector.
+     */
+    private void registerSyncTick() {
+        ClientTickEvents.END_CLIENT_TICK.register(SyncClock::tick);
     }
 
     private void registerDisconnectCleanup() {

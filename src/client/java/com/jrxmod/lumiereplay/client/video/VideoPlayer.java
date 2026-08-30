@@ -1,6 +1,7 @@
 package com.jrxmod.lumiereplay.client.video;
 
 import com.jrxmod.lumiereplay.LumierePlay;
+import com.jrxmod.lumiereplay.client.LumiereConfig;
 import com.jrxmod.lumiereplay.client.render.ScreenTexture;
 import com.jrxmod.lumiereplay.client.sound.ProjectorSound;
 import com.jrxmod.lumiereplay.client.ytdlp.PipeProxy;
@@ -52,6 +53,22 @@ public class VideoPlayer implements AutoCloseable {
     private volatile Runnable     onRetry             = null;
     private          Timer       firstFrameTimer     = null;
 
+    /**
+     * Media time the local stream is behind the shared projector timeline.
+     * Set when the source was opened at an offset (a piped stream that had to be
+     * re-resolved with --download-sections) so that reported and requested
+     * positions are always expressed in timeline terms, not in stream terms.
+     */
+    private volatile long        positionOffsetMs    = 0L;
+
+    /**
+     * Size the media itself reports, captured from the first buffer format call.
+     * The render target is fixed, so this is the only place where a viewer can see
+     * whether a quality request was actually served.
+     */
+    private volatile int         sourceWidth         = 0;
+    private volatile int         sourceHeight        = 0;
+
     public VideoPlayer(String source, ScreenTexture screenTexture, BlockPos projectorPos) {
         this.source        = source;
         this.screenTexture = screenTexture;
@@ -59,6 +76,10 @@ public class VideoPlayer implements AutoCloseable {
     }
 
     public String getSource() { return source; }
+
+    /** Delivered source size, or 0 when the media has not reported one yet. */
+    public int getSourceWidth()  { return sourceWidth; }
+    public int getSourceHeight() { return sourceHeight; }
 
     public void play() {
         state = PlayerState.LOADING;
@@ -86,7 +107,7 @@ public class VideoPlayer implements AutoCloseable {
                     "--quiet",
                     "--no-metadata-network-access"
                   };
-            factory = new MediaPlayerFactory(factoryArgs);
+            factory = new MediaPlayerFactory(withConfiguredArgs(factoryArgs));
 
             mediaPlayer = factory.mediaPlayers().newEmbeddedMediaPlayer();
 
@@ -230,14 +251,43 @@ public class VideoPlayer implements AutoCloseable {
         return idx == 0 || s.charAt(idx - 1) == '/' || s.charAt(idx - 1) == '\\';
     }
 
+    /**
+     * Appends the user supplied libvlc arguments from config/lumiereplay.json.
+     * Blank entries are dropped and the count is capped, because the arguments
+     * are passed straight to libvlc and an unbounded or half written list would
+     * make every player instance fail to start.
+     */
+    private static String[] withConfiguredArgs(String[] base) {
+        String[] extra = LumiereConfig.get().network.vlc_args;
+        if (extra == null || extra.length == 0) return base;
+
+        java.util.List<String> kept = new java.util.ArrayList<>();
+        for (String arg : extra) {
+            if (arg == null) continue;
+            arg = arg.trim();
+            if (arg.isEmpty()) continue;
+            kept.add(arg);
+            if (kept.size() >= 16) break;
+        }
+        if (kept.isEmpty()) return base;
+
+        String[] all = new String[base.length + kept.size()];
+        System.arraycopy(base, 0, all, 0, base.length);
+        for (int i = 0; i < kept.size(); i++) all[base.length + i] = kept.get(i);
+        LumierePlay.LOGGER.info("Applying {} libvlc argument(s) from config", kept.size());
+        return all;
+    }
+
     private class LumiereBufferFormatCallback implements BufferFormatCallback {
         private boolean formatLocked = false;
 
         @Override
-        public BufferFormat getBufferFormat(int sourceWidth, int sourceHeight) {
+        public BufferFormat getBufferFormat(int srcW, int srcH) {
             if (!formatLocked) {
-                LumierePlay.LOGGER.info("VLC source resolution: {}x{}", sourceWidth, sourceHeight);
                 formatLocked = true;
+                sourceWidth  = srcW;
+                sourceHeight = srcH;
+                LumierePlay.LOGGER.info("VLC source resolution: {}x{}", srcW, srcH);
             }
             // Always return fixed render size — HLS streams report different resolutions
             // between fragments which triggers repeated getBufferFormat calls and
@@ -298,10 +348,14 @@ public class VideoPlayer implements AutoCloseable {
         }
     }
 
-    /** Returns current playback position in milliseconds, or -1 if unknown. */
+    /**
+     * Returns current playback position in milliseconds of the shared projector
+     * timeline, or -1 if unknown. A stream opened at an offset reports timeline
+     * time, so every consumer of this value can compare it with the clock.
+     */
     public long getPositionMs() {
         if (mediaPlayer == null) return -1;
-        try { return mediaPlayer.status().time(); } catch (Exception e) { return -1; }
+        try { return mediaPlayer.status().time() + positionOffsetMs; } catch (Exception e) { return -1; }
     }
 
     /** Returns total media length in milliseconds, or -1 if unknown (e.g. live stream). */
@@ -310,22 +364,41 @@ public class VideoPlayer implements AutoCloseable {
         try { return mediaPlayer.status().length(); } catch (Exception e) { return -1; }
     }
 
-    /** Seeks to position in milliseconds. Returns false if not seekable (HLS live). */
+    /**
+     * Seeks to a position in milliseconds of the shared timeline.
+     * Returns false if the media cannot be seeked, which is the normal answer
+     * for a live stream or for a pipe that has no length.
+     */
     public boolean setPositionMs(long ms) {
         if (mediaPlayer == null) return false;
+        long local = Math.max(0L, ms - positionOffsetMs);
         try {
             long len = mediaPlayer.status().length();
-            if (len > 0) {
-                mediaPlayer.controls().setPosition((float) ms / len);
+            // A ratio only describes the open media, so it is unusable once the
+            // stream was cut short by an offset. Those seek by absolute time.
+            if (len > 0 && positionOffsetMs == 0L) {
+                mediaPlayer.controls().setPosition((float) ms / (float) len);
             } else {
-                mediaPlayer.controls().setTime(ms);
+                mediaPlayer.controls().setTime(local);
             }
             return true;
         } catch (Exception e) { return false; }
     }
 
+    /**
+     * Declares that this stream starts at offsetMs of the shared timeline.
+     * Applied when a piped source was re-resolved with a section start.
+     */
+    public void setPositionOffsetMs(long offsetMs) {
+        this.positionOffsetMs = Math.max(0L, offsetMs);
+    }
+
+    public long getPositionOffsetMs() { return positionOffsetMs; }
+
     /** Full restart: stop + re-play the same source. Works for HLS where setPosition fails. */
     public void restart() {
+        sourceWidth  = 0;
+        sourceHeight = 0;
         if (mediaPlayer == null) return;
         try {
             mediaPlayer.controls().stop();
@@ -344,6 +417,8 @@ public class VideoPlayer implements AutoCloseable {
     }
 
     public void close() {
+        sourceWidth  = 0;
+        sourceHeight = 0;
         cancelFirstFrameTimer();
         stop();
         if (mediaPlayer != null) {

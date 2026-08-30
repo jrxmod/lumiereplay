@@ -1,15 +1,11 @@
 package com.jrxmod.lumiereplay;
 
 import com.mojang.serialization.MapCodec;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockRenderType;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.BlockWithEntity;
 import net.minecraft.block.entity.BlockEntity;
-import net.minecraft.block.entity.BlockEntityTicker;
-import net.minecraft.block.entity.BlockEntityType;
-import com.jrxmod.lumiereplay.network.ProjectorSyncPayload;
-import net.fabricmc.fabric.api.networking.v1.PlayerLookup;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.entity.player.PlayerEntity;
@@ -17,6 +13,7 @@ import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.item.ItemStack;
 import net.minecraft.state.StateManager;
 import net.minecraft.state.property.DirectionProperty;
+import net.minecraft.state.property.IntProperty;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.hit.BlockHitResult;
@@ -29,12 +26,24 @@ public class ProjectorBlock extends BlockWithEntity {
 
     public static final MapCodec<ProjectorBlock> CODEC = createCodec(ProjectorBlock::new);
 
-    // Horizontal facing property — NORTH / SOUTH / EAST / WEST
+    // Horizontal facing property - NORTH / SOUTH / EAST / WEST
     public static final DirectionProperty FACING = Properties.HORIZONTAL_FACING;
+
+    /**
+     * Light emitted by the projector, stored in the block state the same way a
+     * vanilla furnace stores its flame. A level of zero means the screen is off.
+     */
+    public static final IntProperty LEVEL = IntProperty.of("level", 0, 15);
+
+    /**
+     * Level used while media is running. Fixed on purpose: the value becomes world
+     * data shared by everyone, so it cannot follow a per player option.
+     */
+    public static final int LEVEL_PLAYING = 12;
 
     public ProjectorBlock(Settings settings) {
         super(settings);
-        setDefaultState(getStateManager().getDefaultState().with(FACING, Direction.NORTH));
+        setDefaultState(getStateManager().getDefaultState().with(FACING, Direction.NORTH).with(LEVEL, 0));
     }
 
     @Override
@@ -42,10 +51,24 @@ public class ProjectorBlock extends BlockWithEntity {
         return CODEC;
     }
 
-    // Registers FACING into the block state system
+    // Registers FACING and LEVEL into the block state system
     @Override
     protected void appendProperties(StateManager.Builder<net.minecraft.block.Block, BlockState> builder) {
-        builder.add(FACING);
+        builder.add(FACING, LEVEL);
+    }
+
+    /**
+     * Turns the light of a projector on or off. Server side only, because the level
+     * lives in the block state, and a no-op when the value already matches so a
+     * play/pause pair costs a single lighting update.
+     */
+    public static void setLevel(World world, BlockPos pos, int level) {
+        if (world == null || world.isClient()) return;
+        BlockState state = world.getBlockState(pos);
+        if (!(state.getBlock() instanceof ProjectorBlock)) return;
+        int wanted = Math.max(0, Math.min(15, level));
+        if (state.get(LEVEL) == wanted) return;
+        world.setBlockState(pos, state.with(LEVEL, wanted), Block.NOTIFY_ALL);
     }
 
     // Projector faces the same direction as the player — toward the wall/screen
@@ -67,23 +90,28 @@ public class ProjectorBlock extends BlockWithEntity {
     }
 
     /**
-     * Stops remote playback immediately when the block is removed or replaced.
+     * Stops remote playback immediately when the block is removed or replaced. The
+     * light is stored in the state, so it disappears together with the block.
      * Without this, clients keep rendering stale video for one or two frames
      * until the renderer notices the block is gone.
      */
     @Override
     protected void onStateReplaced(BlockState state, World world, BlockPos pos,
                                    BlockState newState, boolean moved) {
+        // Turning the light up or down rewrites the state of the same block. That
+        // must leave the stored url, the timeline and the block entity untouched,
+        // so the inherited handling is skipped for exactly that case.
+        boolean lightOnly = !moved
+            && state.isOf(newState.getBlock())
+            && state.get(FACING) == newState.get(FACING)
+            && state.get(LEVEL) != newState.get(LEVEL);
+
         if (!world.isClient() && !state.isOf(newState.getBlock())) {
             if (world instanceof ServerWorld serverWorld) {
-                ProjectorSyncPayload sync = new ProjectorSyncPayload(
-                    pos, "", false, 0, 16, 9, AccessMode.ALL
-                );
-                for (var player : PlayerLookup.tracking(serverWorld, pos)) {
-                    ServerPlayNetworking.send(player, sync);
-                }
+                ModNetworking.sendClear(serverWorld, pos);
             }
         }
+        if (lightOnly) return;
         super.onStateReplaced(state, world, pos, newState, moved);
     }
 
@@ -127,18 +155,7 @@ public class ProjectorBlock extends BlockWithEntity {
 
     private static void broadcastSync(ProjectorBlockEntity projector,
                                       ServerWorld world, BlockPos pos) {
-        ProjectorSyncPayload sync = new ProjectorSyncPayload(
-            pos,
-            projector.getVideoUrl(),
-            projector.isPlaying(),
-            projector.getVolume(),
-            projector.getScreenWidth(),
-            projector.getScreenHeight(),
-            projector.getAccessMode()
-        );
-        for (var player : PlayerLookup.tracking(world, pos)) {
-            ServerPlayNetworking.send(player, sync);
-        }
+        ModNetworking.broadcastState(projector, world);
     }
 
     @Nullable
