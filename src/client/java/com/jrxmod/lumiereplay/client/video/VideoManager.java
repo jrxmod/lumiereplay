@@ -22,14 +22,19 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class VideoManager {
 
-    private static final Map<BlockPos, VideoPlayer>         players       = new ConcurrentHashMap<>();
-    private static final Set<BlockPos>                      pending       = ConcurrentHashMap.newKeySet();
-    private static final Map<BlockPos, UrlResolver.Quality> activeQuality = new ConcurrentHashMap<>();
-    private static final Map<BlockPos, Integer>             retryCount    = new ConcurrentHashMap<>();
-    private static final Map<BlockPos, String>              retryOrigin   = new ConcurrentHashMap<>();
-    private static final Map<BlockPos, UrlResolver.Quality> retryQuality  = new ConcurrentHashMap<>();
-    private static final Map<BlockPos, Integer>             retryVolume   = new ConcurrentHashMap<>();
-    private static final Set<BlockPos>                      lazyPaused    = ConcurrentHashMap.newKeySet();
+    private static final Map<BlockPos, VideoPlayer>         players        = new ConcurrentHashMap<>();
+    private static final Set<BlockPos>                      pending        = ConcurrentHashMap.newKeySet();
+    private static final Map<BlockPos, UrlResolver.Quality> activeQuality  = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, Integer>             retryCount     = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, String>              retryOrigin    = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, UrlResolver.Quality> retryQuality   = new ConcurrentHashMap<>();
+    private static final Map<BlockPos, Integer>             retryVolume    = new ConcurrentHashMap<>();
+    private static final Set<BlockPos>                      lazyPaused     = ConcurrentHashMap.newKeySet();
+
+    /** Abandon actions for in-flight resolutions, so a stop can kill a download. */
+    private static final Map<BlockPos, Runnable>            pendingCancels = new ConcurrentHashMap<>();
+    /** Projectors whose resolution was cancelled, so the late callback is dropped. */
+    private static final Set<BlockPos>                      cancelledResolve = ConcurrentHashMap.newKeySet();
 
     private static final int[]  RETRY_DELAYS_SEC = {2, 5, 15};
     private static final int    MAX_RETRIES      = 3;
@@ -42,6 +47,9 @@ public class VideoManager {
         if (!playing || url.isEmpty()) {
             pending.remove(pos);
             activeQuality.remove(pos);
+            // Abandon any in-flight download so it does not keep running after
+            // the source was cleared or paused.
+            cancelPendingResolve(pos);
             if (existing != null) {
                 existing.close();
                 players.remove(pos);
@@ -96,7 +104,7 @@ public class VideoManager {
         // Local files and direct stream URLs are seekable once open, so a new
         // viewer starts immediately and is aligned on the first playing frame.
         if (target > 0) SyncClock.queueStartSeek(pos, target);
-        startPlayer(pos, url, volume, quality, 0L);
+        startPlayer(pos, url, url, volume, quality, 0L);
     }
 
     public static void update(BlockPos posIn, String url, boolean playing, int volume) {
@@ -143,6 +151,7 @@ public class VideoManager {
         activeQuality.remove(pos);
         lazyPaused.remove(pos);
         retryVolume.remove(pos);
+        cancelPendingResolve(pos);
         SyncClock.reset(pos);
         VideoPlayer p = players.remove(pos);
         if (p != null) p.close();
@@ -156,15 +165,18 @@ public class VideoManager {
     private static void resolveAndStart(BlockPos pos, String url, int volume,
                                         UrlResolver.Quality quality, long startMs) {
         pending.add(pos);
+        cancelledResolve.remove(pos);
         ScreenTexture tex = ProjectorRenderer.getTextures().get(pos);
         if (tex != null && !tex.isClosed()) tex.fillStatus(PlayerState.RESOLVING);
 
         LumierePlay.LOGGER.info("Resolving [{}] URL for projector at {}{}",
             quality.label, pos, startMs > 0 ? " from " + (startMs / 1000L) + "s" : "");
 
-        UrlResolver.resolveAsync(url, quality, startMs, resolved ->
+        Runnable cancel = UrlResolver.resolveAsync(url, quality, startMs, resolved ->
             MinecraftClient.getInstance().execute(() -> {
                 pending.remove(pos);
+                pendingCancels.remove(pos);
+                if (cancelledResolve.remove(pos)) return;
                 if (resolved == null) {
                     if (startMs > 0) {
                         LumierePlay.LOGGER.warn(
@@ -178,16 +190,32 @@ public class VideoManager {
                     if (t != null && !t.isClosed()) t.fillStatus(PlayerState.ERROR);
                     return;
                 }
-                startPlayer(pos, resolved, volume, quality, startMs);
+                startPlayer(pos, url, resolved, volume, quality, startMs);
             }));
+        if (cancel != null) pendingCancels.put(pos, cancel);
     }
 
     /**
-     * Opens a player. startMs declares that the media itself begins that far into
-     * the shared timeline, which keeps reported positions comparable.
+     * Abandons an in-flight resolution for pos. The cancel action kills the
+     * underlying download (yt-dlp) and deletes its temp files, so a long source
+     * that was stopped is not left running in the background. Safe to call for a
+     * projector with no outstanding resolution.
      */
-    private static void startPlayer(BlockPos pos, String url, int volume,
-                                    UrlResolver.Quality quality, long startMs) {
+    private static void cancelPendingResolve(BlockPos pos) {
+        cancelledResolve.add(pos);
+        Runnable cancel = pendingCancels.remove(pos);
+        if (cancel != null) cancel.run();
+    }
+
+    /**
+     * Opens a player. playUrl is the resolved stream or file handed to VLC;
+     * originUrl is the source the user entered, used to pick any extra libvlc
+     * headers a host requires (some live HLS endpoints reject requests without
+     * a browser Referer/User-Agent). startMs declares that the media itself
+     * begins that far into the shared timeline, keeping positions comparable.
+     */
+    private static void startPlayer(BlockPos pos, String originUrl, String playUrl,
+                                    int volume, UrlResolver.Quality quality, long startMs) {
         VideoPlayer old = players.remove(pos);
         if (old != null) old.close();
 
@@ -201,7 +229,8 @@ public class VideoManager {
 
         tex.fillStatus(PlayerState.LOADING);
 
-        VideoPlayer player = new VideoPlayer(url, tex, pos);
+        VideoPlayer player = new VideoPlayer(playUrl, tex, pos,
+            UrlResolver.vlcHttpArgs(originUrl));
         player.setVolume(volume);
         player.setOnRetry(buildRetryCallback(pos));
         if (startMs > 0) player.setPositionOffsetMs(startMs);
@@ -218,6 +247,8 @@ public class VideoManager {
         retryQuality.clear();
         retryVolume.clear();
         lazyPaused.clear();
+        pendingCancels.clear();
+        cancelledResolve.clear();
         SyncClock.resetAll();
         players.values().forEach(VideoPlayer::close);
         players.clear();

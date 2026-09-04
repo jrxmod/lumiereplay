@@ -5,25 +5,33 @@ import com.jrxmod.lumiereplay.client.LumiereConfig;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
  * Resolves platform URLs to playable URLs via yt-dlp.
  *
- * Two resolution strategies:
+ * Three resolution strategies, chosen by content kind:
  *
- *   PROXY  — YouTube / Twitch / VK etc.: yt-dlp | ffmpeg | FIFO. VLC opens
- *             the FIFO as a local file. ffmpeg rewrites discontinuous PCR
- *             timestamps so VLC receives a clean, continuous MPEG-TS stream.
- *             (YouTube HLS segments have PCR discontinuities that crash VLC
- *             if played directly; ffmpeg with +genpts fixes this.)
+ *   FILE (YouTube and other on demand). yt-dlp downloads the media into a
+ *             completed temporary file that VLC reads end to end. YouTube may
+ *             serve only split video and audio streams (e.g. on a throttled
+ *             network), so a muxed file is the portable way to get one file VLC
+ *             can play; a VOD stays seekable to the end and no signed CDN
+ *             headers are needed. Until the download finishes a buffering phase
+ *             precedes playback.
  *
- *   DIRECT — yt-dlp --get-url returns a stream URL that VLC fetches directly.
- *             Used for platforms without HLS PCR issues.
+ *   STREAM (live broadcasts). yt-dlp --get-url returns a single stream URL that
+ *             VLC fetches directly over the network. A network stream has no
+ *             finite end, so a live broadcast keeps playing instead of freezing
+ *             at the end of a still-growing temp file. Works the same on Windows
+ *             and Linux.
  */
 public class UrlResolver {
 
@@ -61,19 +69,16 @@ public class UrlResolver {
         "firefox", "chrome", "chromium", "brave", "opera"
     };
 
-    private static final String[] SUPPORTED_PATTERNS = {
-        "youtube.com", "youtu.be",
-        "twitch.tv",
-        "vimeo.com",
-        "dailymotion.com",
-        "soundcloud.com",
-        "vk.com/video",
-        "vkvideo.ru",
-        "rutube.ru",
-        "ok.ru/video"
-    };
+    /**
+     * Browser user agent used when a resolved stream URL has to be fetched by
+     * VLC itself. Some CDNs (VK/OK use the okcdn.net origin) reject requests
+     * that do not look like a browser, so VLC is told to send this header.
+     */
+    private static final String CHROME_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        + "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
-    private static final String[] PROXY_PATTERNS = {
+    private static final String[] SUPPORTED_PATTERNS = {
         "youtube.com", "youtu.be",
         "twitch.tv",
         "vimeo.com",
@@ -97,11 +102,17 @@ public class UrlResolver {
         return false;
     }
 
-    private static boolean needsProxy(String url) {
+    /**
+     * True for the sources handled by the temp-file download path. YouTube is
+     * the only supported host that may require yt-dlp to merge split video and
+     * audio into one file, so it must be downloaded to a completed file. Other
+     * platforms serve a single muxed stream that VLC can play directly over the
+     * network (see {@link #resolveViaDirect}), which also streams live sources
+     * instead of freezing at the end of a still-growing file.
+     */
+    private static boolean isYouTube(String url) {
         String lower = url.toLowerCase();
-        for (String p : PROXY_PATTERNS)
-            if (lower.contains(p)) return true;
-        return false;
+        return lower.contains("youtube.com") || lower.contains("youtu.be");
     }
 
     private static boolean needsCookies(String url) {
@@ -111,12 +122,59 @@ public class UrlResolver {
         return false;
     }
 
-    public static void resolveAsync(String url, Consumer<String> onResolved) {
-        resolveAsync(url, Quality.BEST, onResolved);
+    /**
+     * Extra libvlc arguments to send when VLC plays a resolved stream URL
+     * directly. Live sources on the VK/OK origin serve a signed HLS stream that
+     * is rejected unless the request carries a browser Referer and User-Agent,
+     * which VLC does not send by default. Added only for those hosts; every
+     * other source returns an empty array so existing playback is unchanged.
+     *
+     * @return libvlc arguments (each a single "flag=value" string), or an empty
+     *         array when no extra headers are required.
+     */
+    public static String[] vlcHttpArgs(String origin) {
+        String lower = origin == null ? "" : origin.toLowerCase();
+        boolean vkOrOk = lower.contains("vk.com")
+            || lower.contains("vkvideo.ru")
+            || lower.contains("ok.ru");
+        if (!vkOrOk || !isLive(origin)) return new String[0];
+        // Colon-prefixed so the values are applied as media options to the
+        // player that opens this stream, rather than as factory arguments.
+        return new String[]{
+            ":http-referrer=" + origin,
+            ":http-user-agent=" + CHROME_USER_AGENT
+        };
     }
 
-    public static void resolveAsync(String url, Quality quality, Consumer<String> onResolved) {
-        resolveAsync(url, quality, 0L, onResolved);
+    /**
+     * True for live broadcasts. A live source never ends, so it cannot be
+     * downloaded to a finite local file (VLC would read up to the current end of
+     * the file and stop). It is resolved to a stream URL that VLC plays over the
+     * network instead. Everything else is treated as on demand and is downloaded
+     * to a completed file, which sidesteps the signed CDN URLs some hosts serve
+     * (VLC would need Referer/User-Agent headers it does not send).
+     */
+    private static boolean isLive(String url) {
+        String lower = url.toLowerCase();
+        if (lower.contains("live.vkvideo.ru")) return true;
+        if (lower.contains("twitch.tv")) {
+            // Twitch channels are live; VODs and clips are on demand. This keeps
+            // the common channel case on the streaming path while allowing a
+            // past broadcast to be downloaded and seeked like any other file.
+            return !lower.contains("/videos/")
+                && !lower.contains("/vods/")
+                && !lower.contains("/v/")
+                && !lower.contains("/clip");
+        }
+        return false;
+    }
+
+    public static Runnable resolveAsync(String url, Consumer<String> onResolved) {
+        return resolveAsync(url, Quality.BEST, onResolved);
+    }
+
+    public static Runnable resolveAsync(String url, Quality quality, Consumer<String> onResolved) {
+        return resolveAsync(url, quality, 0L, onResolved);
     }
 
     /**
@@ -126,39 +184,70 @@ public class UrlResolver {
      * skip ahead with --download-sections. A resolved stream URL cannot be
      * offset here: seeking is done through VLC once the media is open, so the
      * direct path ignores startMs and the caller seeks after the first frame.
+     *
+     * Returns a cancel action. A download to a temp file can take long (a whole
+     * movie at a throttled bandwidth), and the caller must be able to abandon it
+     * when the source is stopped or changed; otherwise yt-dlp keeps downloading
+     * in the background long after the user cleared the source. The cancel action
+     * stops the underlying download and is safe to invoke at any time.
      */
-    public static void resolveAsync(String url, Quality quality, long startMs,
-                                    Consumer<String> onResolved) {
+    public static Runnable resolveAsync(String url, Quality quality, long startMs,
+                                        Consumer<String> onResolved) {
         if (!YtDlpManager.isReady()) {
             LumierePlay.LOGGER.warn("yt-dlp not ready, cannot resolve: {}", url);
             onResolved.accept(null);
-            return;
+            return () -> {};
         }
 
+        AtomicReference<Runnable> cancelRef = new AtomicReference<>(() -> {});
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        Runnable cancel = () -> {
+            if (cancelled.compareAndSet(false, true)) {
+                cancelRef.get().run();
+            }
+        };
+
         CompletableFuture.runAsync(() -> {
-            if (needsProxy(url)) {
-                resolveViaProxy(url, quality, startMs, onResolved);
+            if (cancelled.get()) {
+                onResolved.accept(null);
+                return;
+            }
+            if (isYouTube(url) || !isLive(url)) {
+                // YouTube and on demand sources are downloaded to a completed
+                // temp file and played from disk, so VLC never needs to send
+                // signed headers and a VOD stays seekable to the end.
+                resolveViaProxy(url, quality, startMs, onResolved, cancelRef, cancelled);
             } else {
+                // Live sources are handed to VLC as a network stream, which it
+                // treats as unrestricted in length and never stops at a file end.
                 resolveViaDirect(url, quality, onResolved);
             }
         });
+        return cancel;
     }
 
-    // --- Proxy path (YouTube) ---
+    // --- Temp-file download path (YouTube and other on demand sources) ---
 
     /**
-     * Builds the yt-dlp pipe command and starts a StreamProxy.
-     * Returns the proxy's localhost URL to the caller.
+     * Builds the yt-dlp command and starts a PipeProxy that downloads into a
+     * completed temporary file. Returns that file path to the caller.
+     *
+     * Cookie import and IPv4 pinning are intentionally not injected here. Both
+     * change extraction outcome in ways that depend on the host (a Chromium
+     * browser locks its cookie database while running, so --cookies-from-browser
+     * fails; a network that prefers IPv6 breaks under --force-ipv4). They remain
+     * available on demand through network.ytdlp_args, which is appended last and
+     * therefore wins over the mod's own flags.
      */
     private static void resolveViaProxy(String url, Quality quality, long startMs,
-                                        Consumer<String> onResolved) {
-        String browser = detectBrowser();
-
+                                        Consumer<String> onResolved,
+                                        AtomicReference<Runnable> cancelRef,
+                                        AtomicBoolean cancelled) {
         List<String> cmd = new ArrayList<>();
         cmd.add(YtDlpManager.getBinaryPath().toString());
         cmd.add("--no-playlist");
         cmd.add("--no-warnings");
-        cmd.add("--force-ipv4");
+        cmd.add("--no-part");
         cmd.add("-f");
         cmd.add(buildProxyFormatArg(url, quality));
         cmd.add("--hls-use-mpegts");
@@ -179,15 +268,24 @@ public class UrlResolver {
         cmd.add("-o");
         cmd.add("-");
 
-        if (browser != null) {
-            cmd.add("--cookies-from-browser");
-            cmd.add(browser);
-        }
-
         appendConfiguredArgs(cmd);
         cmd.add(url);
 
-        PipeProxy proxy = PipeProxy.start(cmd);
+        // Expose the base path as the cancellation key before the blocking
+        // warm-up starts, so a stop or source change can abandon the download.
+        Path base = PipeProxy.newTempBase();
+        if (base == null) {
+            LumierePlay.LOGGER.error("No temp base path for: {}", url);
+            onResolved.accept(null);
+            return;
+        }
+        cancelRef.set(() -> PipeProxy.release(base.toString()));
+        if (cancelled.get()) {
+            onResolved.accept(null);
+            return;
+        }
+
+        PipeProxy proxy = PipeProxy.start(base, cmd);
         if (proxy != null) {
             LumierePlay.LOGGER.info("PipeProxy [{}] started for: {}", quality.label, url);
             onResolved.accept(proxy.getPath());
@@ -197,7 +295,7 @@ public class UrlResolver {
         }
     }
 
-    // --- Direct path (all other platforms) ---
+    // --- Direct path (non-YouTube platforms) ---
 
     private static void resolveViaDirect(String url, Quality quality,
                                          Consumer<String> onResolved) {
@@ -220,11 +318,6 @@ public class UrlResolver {
     }
 
     /**
-     * Proxy from config/lumiereplay.json, or null when unset. Surrounding
-     * whitespace and bare host values are tolerated because hand edited configs
-     * often carry neither a scheme nor a consistent quoting.
-     */
-    /**
      * Appends the operator supplied yt-dlp arguments from the config file, skipping
      * empty entries and never more than a sane handful. Applied last before the URL,
      * so a repeated option here overrides the one the mod passed.
@@ -241,6 +334,11 @@ public class UrlResolver {
         }
     }
 
+    /**
+     * Proxy from config/lumiereplay.json, or null when unset. Surrounding
+     * whitespace and bare host values are tolerated because hand edited configs
+     * often carry neither a scheme nor a consistent quoting.
+     */
     private static String configuredProxy() {
         String proxy = LumiereConfig.get().network.proxy;
         if (proxy == null) return null;
@@ -353,30 +451,28 @@ public class UrlResolver {
     }
 
     /**
-     * Format selector for the proxy pipe path (all platforms).
-     * All supported platforms go through yt-dlp | ffmpeg | FIFO | VLC.
-     * HLS m3u8_native preferred — yt-dlp outputs continuous MPEG-TS via
-     * --hls-use-mpegts which ffmpeg can re-timestamp cleanly.
-     * Twitch uses named quality levels, not height filters.
+     * Format selector for the temp-file download path. YouTube is requested as
+     * split video and audio because a throttled network may serve only those,
+     * and yt-dlp merges them into a single completed file. Every other on
+     * demand source is a single muxed stream, so a combined format is chosen
+     * and tied to the requested height cap.
      */
     private static String buildProxyFormatArg(String url, Quality quality) {
-        String lower = url.toLowerCase();
-
-        if (lower.contains("twitch.tv")) {
+        if (isYouTube(url)) {
             return switch (quality) {
-                case P720  -> "720p60/720p/best";
-                case P480  -> "480p/best";
-                case P360  -> "360p/best";
-                default    -> "best";
+                case P1080 -> "bv*[height<=1080]+ba/b[height<=1080]/b";
+                case P720  -> "bv*[height<=720]+ba/b[height<=720]/b";
+                case P480  -> "bv*[height<=480]+ba/b[height<=480]/b";
+                case P360  -> "bv*[height<=360]+ba/b[height<=360]/b";
+                default    -> "bv*+ba/b";
             };
         }
-
         return switch (quality) {
-            case P1080 -> "best[height<=1080][protocol=m3u8_native]/best[height<=1080]/best";
-            case P720  -> "best[height<=720][protocol=m3u8_native]/best[height<=720]/best";
-            case P480  -> "best[height<=480][protocol=m3u8_native]/best[height<=480]/best";
-            case P360  -> "best[height<=360][protocol=m3u8_native]/best[height<=360]/best";
-            default    -> "best[protocol=m3u8_native]/best";
+            case P1080 -> "best[height<=1080]/best";
+            case P720  -> "best[height<=720]/best";
+            case P480  -> "best[height<=480]/best";
+            case P360  -> "best[height<=360]/best";
+            default    -> "best";
         };
     }
 
@@ -393,12 +489,17 @@ public class UrlResolver {
                 default    -> "best";
             };
         }
+        // A single muxed format is required because --get-url can only print
+        // one URL. Split video+audio needs an ffmpeg merge into a file, which a
+        // direct stream cannot do, so a combined format is requested instead and
+        // the height is capped to control size. The bare /best tail covers hosts
+        // that expose only one combined stream.
         return switch (quality) {
-            case P1080 -> "best[height<=1080][protocol=https]/best[height<=1080]/best";
-            case P720  -> "best[height<=720][protocol=https]/best[height<=720]/best";
-            case P480  -> "best[height<=480][protocol=https]/best[height<=480]/best";
-            case P360  -> "best[height<=360][protocol=https]/best[height<=360]/best";
-            default    -> "best[protocol=https]/best";
+            case P1080 -> "best[height<=1080]/best";
+            case P720  -> "best[height<=720]/best";
+            case P480  -> "best[height<=480]/best";
+            case P360  -> "best[height<=360]/best";
+            default    -> "best";
         };
     }
 }

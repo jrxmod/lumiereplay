@@ -661,7 +661,12 @@ public class ProjectorScreen extends Screen {
             PlayerState pstate = VideoManager.getState(ProjectorScreen.this.pos);
             boolean isLoading = pstate == PlayerState.LOADING || pstate == PlayerState.RESOLVING;
 
-            if (lenMs <= 0) {
+            // A live stream reports a short sliding length (the HLS window), so
+            // the local position quickly leaves it behind. Treat a zero or a
+            // position that has clearly passed the reported length as live: the
+            // slider disables and is never pushed past the widget.
+            boolean live = lenMs <= 0 || posMs > lenMs + 1000L;
+            if (live) {
                 seekable = false;
                 Text liveLabel = Text.translatable("gui.lumiereplay.projector.live");
                 if (isLoading || (buf > 0 && buf < 100)) {
@@ -673,7 +678,7 @@ public class ProjectorScreen extends Screen {
                 return;
             }
             seekable = true;
-            this.value = lenMs > 0 ? (double) posMs / (double) lenMs : 0.0;
+            this.value = Math.max(0.0, Math.min(1.0, (double) posMs / (double) lenMs));
 
             String timeLabel = formatTime(posMs) + " / " + formatTime(lenMs);
             if (isLoading || (buf > 0 && buf < 100)) {

@@ -34,12 +34,22 @@ import java.util.TimerTask;
  */
 public class VideoPlayer implements AutoCloseable {
 
-    /** How long to wait for the first decodable frame before failing the source. */
-    private static final long FIRST_FRAME_TIMEOUT_MS = 20_000L;
+    /**
+     * How long the first decodable frame may be delayed before the watchdog
+     * considers the source, and the window of data silence that makes it give up.
+     * A source that keeps feeding VLC (slow cold start, throttled download)
+     * re-arms the watchdog and is never failed on a deadline; only a source that
+     * stops delivering data is declared dead after this much time without any.
+     */
+    private static final long FIRST_FRAME_TIMEOUT_MS = 60_000L;
+    private static final long FIRST_FRAME_TIMEOUT_NS = FIRST_FRAME_TIMEOUT_MS * 1_000_000L;
 
     private final String        source;
     private final ScreenTexture screenTexture;
     private final BlockPos      projectorPos;
+
+    /** Extra libvlc arguments (e.g. HTTP Referer/User-Agent) VLC must send. */
+    private final String[]       httpArgs;
 
     private MediaPlayerFactory  factory;
     private EmbeddedMediaPlayer mediaPlayer;
@@ -50,6 +60,7 @@ public class VideoPlayer implements AutoCloseable {
     private          int         frameCounter    = 0;
     private volatile boolean     firstFrameReceived  = false;
     private volatile int         bufferPercent       = 0;
+    private volatile long        lastDataEventNanos  = 0L;
     private volatile Runnable     onRetry             = null;
     private          Timer       firstFrameTimer     = null;
 
@@ -70,9 +81,15 @@ public class VideoPlayer implements AutoCloseable {
     private volatile int         sourceHeight        = 0;
 
     public VideoPlayer(String source, ScreenTexture screenTexture, BlockPos projectorPos) {
+        this(source, screenTexture, projectorPos, new String[0]);
+    }
+
+    public VideoPlayer(String source, ScreenTexture screenTexture, BlockPos projectorPos,
+                       String[] httpArgs) {
         this.source        = source;
         this.screenTexture = screenTexture;
         this.projectorPos  = projectorPos;
+        this.httpArgs      = httpArgs != null ? httpArgs : new String[0];
     }
 
     public String getSource() { return source; }
@@ -175,6 +192,11 @@ public class VideoPlayer implements AutoCloseable {
                 @Override
                 public void buffering(MediaPlayer mp, float newCache) {
                     bufferPercent = (int) newCache;
+                    // Any buffering callback means VLC is pulling data from the
+                    // pipe or file. Remember when, so the first-frame watchdog can
+                    // tell a slow source from a dead one: a source still feeding
+                    // VLC must not be failed on the frame deadline.
+                    lastDataEventNanos = System.nanoTime();
                     // Never overwrite PAUSED state — buffering events fire during pause too
                     if (state != PlayerState.PAUSED && newCache < 100f) {
                         state = PlayerState.LOADING;
@@ -188,12 +210,27 @@ public class VideoPlayer implements AutoCloseable {
                 }
             });
 
-            mediaPlayer.audio().setVolume(targetVolume);
-            mediaPlayer.media().play(source);
+            applyVolume(mediaPlayer);
+            playMedia();
 
         } catch (Exception e) {
             state = PlayerState.ERROR;
             LumierePlay.LOGGER.error("VLC init failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Starts playback of {@link #source}. When the source needs extra headers
+     * (some live HTTP streams reject requests without a browser Referer or
+     * User-Agent) they are passed as colon-prefixed media options, which is how
+     * vlcj feeds per-media configuration to libvlc. Factory arguments affect the
+     * whole player instance and are not suitable for per-source headers.
+     */
+    private void playMedia() {
+        if (httpArgs.length == 0) {
+            mediaPlayer.media().play(source);
+        } else {
+            mediaPlayer.media().play(source, httpArgs);
         }
     }
 
@@ -224,17 +261,34 @@ public class VideoPlayer implements AutoCloseable {
     }
 
     public void setVolume(int vol) {
-        this.targetVolume = Math.max(0, Math.min(100, vol));
-        if (mediaPlayer != null) {
-            float spatial = ProjectorSound.getEffectiveVolume(projectorPos);
-            // Apply square-root curve for perceptual loudness
-            int curvedVol = (int)(Math.sqrt(targetVolume / 100.0) * 100);
-            mediaPlayer.audio().setVolume((int)(curvedVol * spatial));
-        }
+        int clamped = Math.max(0, Math.min(100, vol));
+        this.targetVolume = clamped;
+        // Keep the projector-wide base in sync so the spatial falloff is applied
+        // against the current setting even before the state round trip comes back.
+        ProjectorSound.setBaseVolume(projectorPos, clamped);
+        applyVolume(mediaPlayer);
     }
 
     public PlayerState getState() { return state; }
     public int getBufferPercent() { return bufferPercent; }
+
+    /**
+     * Applies the current volume and the distance falloff to a media player.
+     *
+     * {@link ProjectorSound#getEffectiveVolume} already folds the user volume and
+     * the spatial attenuation into a single 0..1 factor, so applying the volume
+     * here must not multiply by the target volume again. The perceptual
+     * square-root curve is applied once, from this method, and the render loop
+     * calls the same method instead of a second, linear formula; two competing
+     * paths made the level jump between them every frame group.
+     */
+    private void applyVolume(MediaPlayer mp) {
+        if (mp == null) return;
+        float effective = ProjectorSound.getEffectiveVolume(projectorPos);
+        int vlcVol = (int)(Math.sqrt(Math.max(0f, effective)) * 100f);
+        vlcVol = Math.max(0, Math.min(200, vlcVol));
+        try { mp.audio().setVolume(vlcVol); } catch (Exception ignored) {}
+    }
 
     public void setOnRetry(Runnable r) { this.onRetry = r; }
 
@@ -341,9 +395,7 @@ public class VideoPlayer implements AutoCloseable {
             screenTexture.upload();
 
             if (++frameCounter % 15 == 0) {
-                float spatial = ProjectorSound.getEffectiveVolume(projectorPos);
-                int   vlcVol  = Math.max(0, Math.min(200, (int)(targetVolume * spatial)));
-                try { mp.audio().setVolume(vlcVol); } catch (Exception ignored) {}
+                applyVolume(mp);
             }
         }
     }
@@ -406,7 +458,7 @@ public class VideoPlayer implements AutoCloseable {
             new Thread(() -> {
                 try { Thread.sleep(150); } catch (InterruptedException ignored) {}
                 try {
-                    mediaPlayer.media().play(source);
+                    playMedia();
                 } catch (Exception e) {
                     LumierePlay.LOGGER.warn("Restart failed for {}: {}", projectorPos, e.getMessage());
                 }
@@ -429,7 +481,7 @@ public class VideoPlayer implements AutoCloseable {
             factory.release();
             factory = null;
         }
-        // Release the PipeProxy if this player was using one (FIFO or temp file)
+        // Release the PipeProxy if this player was using a temp file or a pipe.
         if (source != null && (source.startsWith("/tmp/") || source.startsWith("/var/")
                 || source.contains("lumiereplay_"))) {
             PipeProxy.release(source);
@@ -449,6 +501,16 @@ public class VideoPlayer implements AutoCloseable {
             public void run() {
                 if (firstFrameReceived) return;
                 if (state == PlayerState.ERROR || state == PlayerState.IDLE) return;
+                // A source that is still feeding VLC but has produced no decodable
+                // frame yet is alive and merely slow (cold start, throttled
+                // download). Re-arm instead of failing it. Only a source that has
+                // stopped delivering data is declared dead after the silence window.
+                if (lastDataEventNanos != 0L
+                        && System.nanoTime() - lastDataEventNanos < FIRST_FRAME_TIMEOUT_NS) {
+                    cancelFirstFrameTimer();
+                    scheduleFirstFrameTimer();
+                    return;
+                }
                 LumierePlay.LOGGER.error(
                     "No frame decoded within {}ms for: {}",
                     FIRST_FRAME_TIMEOUT_MS, source

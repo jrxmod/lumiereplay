@@ -32,9 +32,10 @@ away catches up on its own. A single catch-up move is limited to
 rather than one teleport.
 
 Sources that report no duration (live streams and platform streams fed through a
-pipe) are left alone entirely: seeking them is not possible, so the panel refuses
-the request and the shared timeline is neither corrected nor displayed for them.
-For those sources alignment can only happen before playback starts.
+temporary file) are left alone entirely: seeking them is not possible, so the
+panel refuses the request and the shared timeline is neither corrected nor
+displayed for them. For those sources alignment can only happen before playback
+starts.
 
 ## Quality and resolution
 
@@ -42,27 +43,43 @@ The quality row is a request, and the panel prints the size the source actually
 delivered next to it, in orange when it clearly missed the cap. Two limits decide
 what you can see:
 
-- Platform streams fed through a pipe (YouTube, Twitch, VK) have to be one file
-  that already contains audio: yt-dlp does not merge a separate video and audio
-  stream into stdout. For YouTube the muxed choices are progressive mp4 (usually
-  up to 360p) and HLS variants (up to 1080p), and the selector prefers HLS, so a
-  video without HLS variants stays capped no matter which button you press.
+- Platform streams (YouTube, Twitch, VK) are downloaded into a temporary file,
+  so yt-dlp must produce one file that already contains audio: a progressive mp4
+  is fine, while a separate video and audio stream can only be used when yt-dlp
+  is told to mux them into a file. For YouTube the muxed choices are progressive
+  mp4 (usually up to 360p) and HLS variants (up to 1080p), and the selector
+  prefers HLS, so a video without HLS variants stays capped no matter which
+  button you press.
 - The screen renders into a fixed 1280x720 texture and the picture on your
   monitor is about `screenWidth * 16` pixels across, so a 16x9 screen shows
   roughly 256x144 of detail whatever was downloaded. A bigger screen is what
   makes a higher quality visible.
 
-On Windows the media is written to a temporary file rather than a pipe, so yt-dlp
-is free to mux a separate video and audio stream. There `network.ytdlp_args` can
-already raise the ceiling without any change in the mod, for example:
+On every platform the media is written to a temporary file rather than a pipe.
+That keeps the source seekable, so both progressive MP4 and HLS/MPEG-TS play
+through VLC; a pipe would break progressive MP4 because its track metadata sits
+at the end of the file and a pipe is not seekable. The player waits for yt-dlp to
+write the first chunk before it opens the file, so a stream is never opened while
+the file is still empty. The temporary file lives in <gameDir>/lumiereplay/temp on your real disk, not
+on a tmpfs/ramdisk, so a large download does not eat your RAM. Any file a
+previous session left in that folder is deleted automatically when you leave
+the world. There `network.ytdlp_args` can already raise the ceiling
+without any change in the mod, for example:
 
 ```json
 "network": { "ytdlp_args": ["-f", "bv*[height<=1080]+ba/b[height<=1080]/best"] }
 ```
 
-On Linux and macOS the same list makes yt-dlp warn that the two streams will be
-concatenated instead of muxed, because output goes to stdout: that path needs a
-muxer in front of the pipe, which is not part of this release.
+Using that form on any platform lets yt-dlp mux a separate video and audio stream
+into the temporary file; it just needs yt-dlp to write a single file as the
+result, which it does when the target is a file rather than stdout.
+
+Cookie import and IPv4 pinning are not forced. The mod no longer passes
+`--cookies-from-browser` or `--force-ipv4` on its own: a Chromium browser locks
+its cookie database while it is running, which made yt-dlp abort the whole
+resolve, and `--force-ipv4` broke streams on networks that prefer IPv6. If your
+account or network needs them, add them through `network.ytdlp_args`, for
+example `["--cookies-from-browser", "firefox"]`.
 
 ## Ambient light
 
@@ -100,7 +117,7 @@ screen at noon. That part is visual only and belongs to each viewer, which is wh
 | `sync.check_interval_ms` | `5000` | How often a viewer compares itself with the timeline |
 | `sync.grace_ms` | `4000` | Quiet period after a start or a seek |
 | `sync.max_step_ms` | `30000` | Largest jump one correction makes; bigger gaps close in several steps |
-| `sync.jump_on_join` | `false` | Reopen a piped stream (YouTube, Twitch, VK) at the shared position for a viewer who joins late. Costs one extra resolve step and is best effort |
+| `sync.jump_on_join` | `false` | Reopen a platform stream (YouTube, Twitch, VK) at the shared position for a viewer who joins late. Costs one extra resolve step and is best effort |
 
 ## Requirements
 
@@ -129,11 +146,11 @@ chmod +x build.sh install.sh gradlew
 ./build.sh
 ```
 
-Output: `build/libs/lumiereplay-0.7.0.jar` (or whatever `mod_version` is set to)
+Output: `build/libs/lumiereplay-0.7.1.jar` (or whatever `mod_version` is set to)
 
 ## Version compatibility
 
-The projector command and state packets have two wire formats. A 0.7.0 client on
+The projector command and state packets have two wire formats. A 0.7.x client on
 a server that still runs 0.6.x keeps working, but seeking and shared quality need
 both sides on 0.7.0 or newer.
 

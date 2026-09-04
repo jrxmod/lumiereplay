@@ -2,46 +2,63 @@ package com.jrxmod.lumiereplay.client.ytdlp;
 
 import com.jrxmod.lumiereplay.LumierePlay;
 import com.jrxmod.lumiereplay.client.LumiereConfig;
+import net.minecraft.client.MinecraftClient;
 
-import java.io.IOException;
+import java.io.BufferedReader;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 /**
- * Cross-platform pipe proxy: yt-dlp stdout -> ffmpeg -> FIFO -> VLC.
+ * Downloads a platform stream into a temporary file that VLC opens directly.
  *
- * YouTube HLS streams contain discontinuous PCR timestamps at segment
- * boundaries. VLC cannot recover from these jumps and freezes video while
- * audio continues. Piping through ffmpeg with +genpts regenerates monotonic
- * PTS/PCR values so VLC receives a clean, continuous TS stream.
+ * A FIFO (named pipe) works for HLS/MPEG-TS but not for the split streams
+ * yt-dlp often has to merge (progressive MP4's moov atom sits at the end of the
+ * file, and a pipe is not seekable, so a demuxer cannot read it). Writing to a
+ * seekable temporary file lets VLC read both a muxed MP4 and MPEG-TS.
  *
- * Pipeline:
- *   yt-dlp -f m3u8_native --hls-use-mpegts -o - URL
- *     | ffmpeg -fflags +genpts+discardcorrupt -i pipe:0 -c copy -f mpegts pipe:1
- *     > FIFO
- *   VLC opens FIFO as a local file
- *
- * Linux / macOS: POSIX named pipe (mkfifo) — zero-copy kernel pipe.
- * Windows: temp file — yt-dlp downloads fully before VLC opens it.
+ * The output path uses a %(ext)s placeholder because yt-dlp chooses the
+ * container extension itself: a hard-coded ".ts" target is overridden by yt-dlp
+ * (for a split video+audio it writes ".mp4"/".mkv"), which would leave VLC
+ * looking for a file that never existed. The real file is located after the
+ * download starts and the located path is what VLC receives. yt-dlp's stderr is
+ * logged so a network or format failure is visible in the game log instead of
+ * being swallowed.
  */
 public class PipeProxy {
 
     private static final Map<String, PipeProxy> ACTIVE = new ConcurrentHashMap<>();
 
-    private static final boolean IS_WINDOWS =
-        System.getProperty("os.name", "").toLowerCase().contains("win");
+    /**
+     * Longest wait for the download to produce a playable file. For split
+     * streams (bestvideo+bestaudio) yt-dlp downloads both tracks and merges them
+     * into one file only at the end, so no data is visible until the download
+     * completes. A generous timeout covers that case; progress is logged so the
+     * wait does not look like a hang.
+     */
+    private static final long WARM_START_TIMEOUT_MS = 30L * 60L * 1000L;
 
-    private final Path           pipePath;
+    /** Intervals at which download progress is logged, in millis. */
+    private static final long PROGRESS_LOG_INTERVAL_MS = 15_000L;
+
+    /**
+     * How long a download may show no byte growth before it is treated as
+     * stalled. A throttled network still increases the file size slowly, so a
+     * grown file is kept buffering; a total stall (no growth) is failed early
+     * instead of blocking the whole timeout.
+     */
+    private static final long STALL_TIMEOUT_MS = 90_000L;
+
+    private volatile Path       pipePath;
     private volatile Process     ytdlpProc;
-    private volatile Process     ffmpegProc;
     private volatile boolean     stopped = false;
 
     private PipeProxy(Path pipePath) {
@@ -49,24 +66,34 @@ public class PipeProxy {
     }
 
     /**
-     * Creates the pipe, starts the yt-dlp | ffmpeg pipeline writing into it,
-     * and returns the path VLC should open. Returns null on failure.
+     * Builds a unique temp base path, starts yt-dlp writing to it, waits for a
+     * playable file to exist, and returns the path VLC should open. Returns
+     * null on failure.
+     *
+     * The base path is supplied by the caller (see {@link #newTempBase()}) so it
+     * can be used as the cancellation key before this method blocks on warm-up.
      */
-    public static PipeProxy start(List<String> ytdlpCmd) {
+    public static PipeProxy start(Path pipe, List<String> ytdlpCmd) {
+        if (pipe == null) return null;
         try {
-            Path pipe = IS_WINDOWS ? createTempFile() : createFifo();
-            if (pipe == null) return null;
-
             PipeProxy proxy = new PipeProxy(pipe);
             ACTIVE.put(pipe.toString(), proxy);
 
-            if (IS_WINDOWS) {
-                proxy.startDownload(ytdlpCmd);
-            } else {
-                proxy.startFifoPump(ytdlpCmd);
+            proxy.startDownload(ytdlpCmd);
+            if (!proxy.awaitWarmup()) {
+                ACTIVE.remove(pipe.toString());
+                proxy.stop();
+                LumierePlay.LOGGER.error(
+                    "Warm start failed for {}: no data from yt-dlp", pipe);
+                return null;
             }
 
-            LumierePlay.LOGGER.info("PipeProxy ready: {}", pipe);
+            // Re-key under the located file path. getPath() returns this path,
+            // and the caller releases with it, so the entry must match.
+            ACTIVE.remove(pipe.toString());
+            String active = proxy.getPath();
+            ACTIVE.put(active, proxy);
+            LumierePlay.LOGGER.info("PipeProxy ready: {}", active);
             return proxy;
 
         } catch (Exception e) {
@@ -84,141 +111,58 @@ public class PipeProxy {
 
     private void stop() {
         stopped = true;
-        Process ff = ffmpegProc;
-        if (ff != null) ff.destroyForcibly();
         Process yt = ytdlpProc;
         if (yt != null) yt.destroyForcibly();
-        try { Files.deleteIfExists(pipePath); } catch (Exception ignored) {}
+        deleteOutputs();
         LumierePlay.LOGGER.info("PipeProxy stopped: {}", pipePath);
     }
 
-    // --- Linux / macOS: FIFO ---
-
-    private static Path createFifo() {
-        try {
-            String name = "lumiereplay_" + UUID.randomUUID().toString().replace("-", "") + ".ts";
-            Path   path = Paths.get(System.getProperty("java.io.tmpdir"), name);
-
-            Process mkfifo = new ProcessBuilder("mkfifo", path.toString())
-                .redirectErrorStream(true).start();
-            mkfifo.getInputStream().transferTo(OutputStream.nullOutputStream());
-
-            if (mkfifo.waitFor() != 0 || !Files.exists(path)) {
-                LumierePlay.LOGGER.error("mkfifo failed for {}", path);
-                return null;
-            }
-            return path;
-        } catch (Exception e) {
-            LumierePlay.LOGGER.error("createFifo error: {}", e.getMessage());
-            return null;
-        }
+    /**
+     * Removes every file this download created in the temp directory: the merged
+     * output yt-dlp produced plus the intermediate per-track files it used while
+     * merging. Matching on the unique base prefix keeps the deletion scoped to
+     * this download.
+     */
+    private void deleteOutputs() {
+        Path base = pipePath.getParent();
+        if (base == null) return;
+        String prefix = pipePath.getFileName().toString();
+        try (var stream = Files.list(base)) {
+            stream.filter(p -> p.getFileName().toString().startsWith(prefix))
+                .forEach(p -> { try { Files.deleteIfExists(p); } catch (Exception ignored) {} });
+        } catch (Exception ignored) {}
     }
 
     /**
-     * Runs yt-dlp piped through ffmpeg, writing the result into the FIFO.
+     * Builds a unique base path in a disk backed temp directory. No file is
+     * created here: yt-dlp appends {@code %(ext)s} and resolves the real
+     * container extension itself, so the base name must not carry an extension
+     * that yt-dlp would misinterpret or override. The random suffix keeps the
+     * path unique per projector and per download.
      *
-     * ffmpeg flags:
-     *   -fflags +genpts          — regenerate PTS when missing or discontinuous
-     *   -fflags +discardcorrupt  — skip corrupt packets instead of aborting
-     *   -c copy                  — no re-encoding, stream copy only
-     *   -f mpegts                — output MPEG-TS (required for streaming)
-     *
-     * This fixes Invalid PCR / TS discontinuity errors produced by YouTube
-     * HLS streams at every segment boundary, which caused VLC to freeze video.
+     * The system temp directory is avoided because on Linux it is commonly a
+     * tmpfs mount (RAM), so buffering a whole video there would consume main
+     * memory. A folder inside the mod's own directory is on the real disk.
      */
-    private void startFifoPump(List<String> ytdlpCmd) {
-        Thread t = new Thread(() -> {
-            try {
-                // Start yt-dlp
-                ProcessBuilder ytPb = new ProcessBuilder(ytdlpCmd);
-                ytPb.redirectErrorStream(false);
-                applyProxy(ytPb);
-                Process ytProc = ytPb.start();
-                ytdlpProc = ytProc;
-
-                drainStderr(ytProc.getErrorStream(), "yt-dlp-stderr");
-
-                // Start ffmpeg reading from yt-dlp stdout
-                List<String> ffCmd = new ArrayList<>();
-                ffCmd.add(FfmpegManager.getBinaryPath().toString());
-                ffCmd.add("-fflags");              ffCmd.add("+genpts+discardcorrupt+igndts");
-                ffCmd.add("-avoid_negative_ts");   ffCmd.add("make_zero");
-                ffCmd.add("-max_interleave_delta"); ffCmd.add("0");
-                ffCmd.add("-i");                   ffCmd.add("pipe:0");
-                ffCmd.add("-c");                   ffCmd.add("copy");
-                ffCmd.add("-f");                   ffCmd.add("mpegts");
-                ffCmd.add("-mpegts_flags");        ffCmd.add("+pat_pmt_at_frames");
-                ffCmd.add("pipe:1");
-
-                ProcessBuilder ffPb = new ProcessBuilder(ffCmd);
-                ffPb.redirectErrorStream(false);
-                applyProxy(ffPb);
-                Process ff = ffPb.start();
-                ffmpegProc = ff;
-
-                drainStderr(ff.getErrorStream(), "ffmpeg-stderr");
-
-                // Pump yt-dlp stdout -> ffmpeg stdin in a dedicated thread
-                Thread pump = new Thread(() -> {
-                    try (InputStream ytOut  = ytProc.getInputStream();
-                         OutputStream ffIn = ff.getOutputStream()) {
-                        byte[] buf = new byte[65536];
-                        int    n;
-                        while (!stopped && (n = ytOut.read(buf)) != -1) {
-                            try {
-                                ffIn.write(buf, 0, n);
-                            } catch (IOException broken) {
-                                break;
-                            }
-                        }
-                    } catch (Exception e) {
-                        if (!stopped) LumierePlay.LOGGER.warn("yt-dlp->ffmpeg pump: {}", e.getMessage());
-                    } finally {
-                        // Signal EOF to ffmpeg
-                        try { ff.getOutputStream().close(); } catch (Exception ignored) {}
-                    }
-                }, "lumiereplay-yt-pump");
-                pump.setDaemon(true);
-                pump.start();
-
-                // ffmpeg stdout -> FIFO
-                try (InputStream ffOut = ff.getInputStream();
-                     OutputStream fifo = Files.newOutputStream(pipePath)) {
-                    byte[] buf = new byte[65536];
-                    int    n;
-                    while (!stopped && (n = ffOut.read(buf)) != -1) {
-                        try {
-                            fifo.write(buf, 0, n);
-                        } catch (IOException broken) {
-                            // VLC closed the FIFO before we finished — stop the
-                            // upstream yt-dlp/ffmpeg to avoid orphaned processes.
-                            break;
-                        }
-                    }
-                }
-
-                // Make sure both upstream processes are gone before we exit
-                if (ff.isAlive()) ff.destroyForcibly();
-                if (ytProc.isAlive()) ytProc.destroyForcibly();
-                ff.waitFor();
-                ytProc.waitFor();
-                LumierePlay.LOGGER.info("PipeProxy pipeline finished: {}", pipePath);
-
-            } catch (Exception e) {
-                if (!stopped) LumierePlay.LOGGER.warn("PipeProxy pump error: {}", e.getMessage());
-            }
-        }, "lumiereplay-pipe-pump");
-        t.setDaemon(true);
-        t.start();
-    }
-
-    // --- Windows: temp file ---
-
-    private static Path createTempFile() {
+    /**
+     * Builds a unique base path in a disk backed temp directory. No file is
+     * created here: yt-dlp appends {@code %(ext)s} and resolves the real
+     * container extension itself, so the base name must not carry an extension
+     * that yt-dlp would misinterpret or override. The random suffix keeps the
+     * path unique per projector and per download.
+     *
+     * The system temp directory is avoided because on Linux it is commonly a
+     * tmpfs mount (RAM), so buffering a whole video there would consume main
+     * memory. A folder inside the mod's own directory is on the real disk.
+     */
+    public static Path newTempBase() {
         try {
-            return Files.createTempFile("lumiereplay_", ".ts");
+            Path gameDir = MinecraftClient.getInstance().runDirectory.toPath();
+            Path tempDir = gameDir.resolve("lumiereplay").resolve("temp").normalize();
+            Files.createDirectories(tempDir);
+            return tempDir.resolve("lumiereplay_" + UUID.randomUUID());
         } catch (Exception e) {
-            LumierePlay.LOGGER.error("createTempFile error: {}", e.getMessage());
+            LumierePlay.LOGGER.error("newTempBase error: {}", e.getMessage());
             return null;
         }
     }
@@ -229,7 +173,7 @@ public class PipeProxy {
                 List<String> cmd = new ArrayList<>(ytdlpCmd);
                 int dashO = cmd.indexOf("-o");
                 if (dashO != -1 && dashO + 1 < cmd.size()) {
-                    cmd.set(dashO + 1, pipePath.toString());
+                    cmd.set(dashO + 1, pipePath + ".%(ext)s");
                 }
 
                 ProcessBuilder pb = new ProcessBuilder(cmd);
@@ -252,9 +196,140 @@ public class PipeProxy {
     }
 
     /**
-     * Points yt-dlp and ffmpeg at the proxy from config/lumiereplay.json.
+     * Blocks until yt-dlp has finished writing a complete file that VLC can read
+     * end to end, or until the timeout elapses. A local file is read up to its
+     * end and then stops, so handing VLC a still growing file would freeze it at
+     * the current end. Only a finished download is therefore accepted; progress
+     * is logged periodically and a stall (no byte growth) fails early instead of
+     * blocking the whole timeout.
+     */
+    private boolean awaitWarmup() {
+        long deadline = System.currentTimeMillis() + WARM_START_TIMEOUT_MS;
+        long lastLog = System.currentTimeMillis();
+        long lastBytes = -1L;
+        long lastGrowth = System.currentTimeMillis();
+        while (System.currentTimeMillis() < deadline) {
+            if (stopped) return false;
+            Process p = ytdlpProc;
+            if (p == null) {
+                try { Thread.sleep(100); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+                continue;
+            }
+            if (!p.isAlive()) {
+                return acceptCompleted();
+            }
+
+            long bytes = totalBytes();
+            if (bytes != lastBytes) {
+                lastBytes = bytes;
+                lastGrowth = System.currentTimeMillis();
+            }
+
+            long now = System.currentTimeMillis();
+            if (now - lastLog >= PROGRESS_LOG_INTERVAL_MS) {
+                lastLog = now;
+                LumierePlay.LOGGER.info(
+                    "PipeProxy downloading {} ({} bytes, yt-dlp running)", pipePath, bytes);
+            }
+            if (bytes > 0 && now - lastGrowth > STALL_TIMEOUT_MS) {
+                LumierePlay.LOGGER.warn(
+                    "PipeProxy download stalled (no growth for {} ms): {}",
+                    now - lastGrowth, pipePath);
+                return false;
+            }
+            try { Thread.sleep(100); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        LumierePlay.LOGGER.warn("PipeProxy warm-up timed out for: {}", pipePath);
+        return acceptCompleted();
+    }
+
+    /**
+     * Total bytes present under this download's base name so far, summing the
+     * merged output and the intermediate per-track files yt-dlp writes. This is
+     * the best proxy for "is the download making progress" because the merged
+     * file does not exist until the very end.
+     */
+    private long totalBytes() {
+        Path base = pipePath.getParent();
+        if (base == null) return 0L;
+        String prefix = pipePath.getFileName().toString();
+        long total = 0L;
+        try (var stream = Files.list(base)) {
+            java.util.Iterator<Path> it = stream.iterator();
+            while (it.hasNext()) {
+                Path p = it.next();
+                if (!p.getFileName().toString().startsWith(prefix)) continue;
+                try { total += Files.size(p); } catch (Exception ignored) {}
+            }
+        } catch (Exception e) {
+            return 0L;
+        }
+        return total;
+    }
+
+    /**
+     * Called when yt-dlp has exited. Accepts the download when a merged output
+     * file exists and is non-empty; rejects it (with a logged reason) when it
+     * wrote nothing. The exit code is reported to make the failure diagnosable.
+     */
+    private boolean acceptCompleted() {
+        Process yt = ytdlpProc;
+        int exit = (yt != null) ? yt.exitValue() : -1;
+        Path located = locateOutput();
+        if (located == null || !Files.exists(located)) {
+            LumierePlay.LOGGER.warn(
+                "yt-dlp exited (exit={}) without writing a file: {}", exit, pipePath);
+            return false;
+        }
+        long size = -1L;
+        try { size = Files.size(located); } catch (Exception ignored) {}
+        if (size <= 0L) {
+            LumierePlay.LOGGER.warn(
+                "yt-dlp exited (exit={}) with an empty file: {}", exit, located);
+            return false;
+        }
+        pipePath = located;
+        LumierePlay.LOGGER.info("PipeProxy download complete (exit={}, {} bytes): {}",
+            exit, size, pipePath);
+        return true;
+    }
+
+    /**
+     * Finds the file yt-dlp actually produced for this download. yt-dlp writes
+     * to {@code <base>.<ext>} (e.g. .mp4, .mkv, .webm), so the bare base path
+     * may not exist. The unique base name is matched as a prefix, which scopes
+     * this search to this download. Intermediate track files used while merging
+     * (named {@code <base>.f<id>.<ext>}) and {@code .part} files are skipped so
+     * VLC never receives a partial or audio-less track.
+     */
+    private Path locateOutput() {
+        Path base = pipePath.getParent();
+        if (base == null) return null;
+        String prefix = pipePath.getFileName().toString();
+        try (var stream = Files.list(base)) {
+            return stream
+                .filter(p -> p.getFileName().toString().startsWith(prefix))
+                .filter(p -> !p.getFileName().toString().endsWith(".part"))
+                .filter(p -> !p.getFileName().toString().matches(
+                    Pattern.quote(prefix) + "\\.f\\d+\\..*"))
+                .max(java.util.Comparator.comparingLong(
+                    p -> { try { return Files.size(p); } catch (Exception e) { return 0L; } }))
+                .orElse(pipePath);
+        } catch (Exception e) {
+            return pipePath;
+        }
+    }
+
+    /**
+     * Points yt-dlp at the proxy from config/lumiereplay.json.
      * Both tools read these variables from the environment, so the setting also
-     * covers requests the tools make on their own. Without a configured proxy the
+     * covers requests the tool makes on its own. Without a configured proxy the
      * inherited environment is left untouched.
      */
     private static void applyProxy(ProcessBuilder pb) {
@@ -272,11 +347,22 @@ public class PipeProxy {
         env.put("all_proxy", proxy);
     }
 
+    /**
+     * Captures yt-dlp stderr and forwards it to the mod logger. Failure
+     * messages from yt-dlp were previously dropped, which made any network or
+     * format problem look like a silent "no data" failure.
+     */
     private static void drainStderr(InputStream err, String threadName) {
         Thread t = new Thread(() -> {
-            try {
-                byte[] buf = new byte[4096];
-                while (err.read(buf) != -1) {}
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(err))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    if (line.startsWith("ERROR:")) {
+                        LumierePlay.LOGGER.error("[yt-dlp] {}", line);
+                    } else if (line.startsWith("WARNING:")) {
+                        LumierePlay.LOGGER.warn("[yt-dlp] {}", line);
+                    }
+                }
             } catch (Exception ignored) {}
         }, "lumiereplay-" + threadName);
         t.setDaemon(true);

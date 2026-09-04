@@ -25,6 +25,11 @@ import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.math.BlockPos;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.stream.Stream;
+
 public class LumierePlayClient implements ClientModInitializer {
 
     @Override
@@ -190,6 +195,29 @@ public class LumierePlayClient implements ClientModInitializer {
             VideoManager.clearAll();
             ProjectorRenderer.clearAll();
             ProjectorSound.clearAll();
+            cleanupTempVideo();
         });
+    }
+
+    /**
+     * Removes every downloaded media file the previous session left in the temp
+     * directory. A file still present here is orphaned because the download that
+     * created it finished or was stopped earlier, so it can never be played
+     * again; keeping it would only consume disk. Only paths with the mod's own
+     * prefix are touched, never anything else under the game folder.
+     */
+    private void cleanupTempVideo() {
+        try {
+            Path gameDir = MinecraftClient.getInstance().runDirectory.toPath();
+            Path tempDir = gameDir.resolve("lumiereplay").resolve("temp").normalize();
+            if (!Files.isDirectory(tempDir)) return;
+            try (Stream<Path> stream = Files.list(tempDir)) {
+                stream.filter(p -> p.getFileName().toString().startsWith("lumiereplay_"))
+                    .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
+            }
+            LumierePlay.LOGGER.info("Cleared leftover media from {}", tempDir);
+        } catch (IOException e) {
+            LumierePlay.LOGGER.warn("Could not clear temp media: {}", e.getMessage());
+        }
     }
 }
